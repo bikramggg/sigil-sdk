@@ -12,19 +12,18 @@ import (
 	"strings"
 	"time"
 
-	sigilv1 "github.com/grafana/sigil-sdk/go/sigil/internal/gen/sigil/v1"
+	sigilv1 "github.com/grafana/sigil-sdk/go/proto/sigil/v1"
+	"github.com/grafana/sigil-sdk/go/proto/sigil/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	tenantHeaderName         = "X-Scope-OrgID"
-	authorizationHeaderName  = "Authorization"
-	httpGenerationExportPath = "/api/v1/generations:export"
+	tenantHeaderName        = wire.TenantHeaderName
+	authorizationHeaderName = wire.AuthorizationHeaderName
 )
 
 type queuedGeneration struct {
@@ -95,9 +94,15 @@ func newGRPCGenerationExporter(cfg GenerationExportConfig) (generationExporter, 
 		transportCreds = insecure.NewCredentials()
 	}
 
+	// gRPC reserves the user-agent metadata key, so the User-Agent must travel
+	// via the dial option rather than outgoing metadata. grpc-go appends its own
+	// token after this value.
+	userAgent, headers := splitUserAgent(cfg.Headers)
+
 	conn, err := grpc.NewClient(
 		endpoint,
 		grpc.WithTransportCredentials(transportCreds),
+		grpc.WithUserAgent(userAgent),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallSendMsgSize(maxSendMessageBytes),
 			grpc.MaxCallRecvMsgSize(maxReceiveMessageBytes),
@@ -110,8 +115,25 @@ func newGRPCGenerationExporter(cfg GenerationExportConfig) (generationExporter, 
 	return &grpcGenerationExporter{
 		client:  sigilv1.NewGenerationIngestServiceClient(conn),
 		conn:    conn,
-		headers: cloneTags(cfg.Headers),
+		headers: headers,
 	}, nil
+}
+
+// splitUserAgent returns the User-Agent to set as the gRPC dial option and the
+// remaining headers with any User-Agent entry removed. When the caller did not
+// supply one, the SDK default (UserAgent) is used.
+func splitUserAgent(headers map[string]string) (userAgent string, rest map[string]string) {
+	userAgent = UserAgent()
+	rest = cloneTags(headers)
+	for key, value := range rest {
+		if strings.EqualFold(key, "User-Agent") {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				userAgent = value
+			}
+			delete(rest, key)
+		}
+	}
+	return userAgent, rest
 }
 
 func (e *grpcGenerationExporter) Export(ctx context.Context, request *sigilv1.ExportGenerationsRequest) (*sigilv1.ExportGenerationsResponse, error) {
@@ -129,41 +151,26 @@ func (e *grpcGenerationExporter) Shutdown(_ context.Context) error {
 }
 
 type httpGenerationExporter struct {
-	endpoint string
-	headers  map[string]string
-	client   *http.Client
+	endpoint  string
+	userAgent string
+	headers   map[string]string
+	client    *http.Client
 }
 
 func newHTTPGenerationExporter(cfg GenerationExportConfig) (generationExporter, error) {
-	trimmed := strings.TrimSpace(cfg.Endpoint)
-	if trimmed == "" {
-		return nil, errors.New("endpoint is required")
-	}
-
-	urlString := trimmed
-	lowerPrefix := strings.ToLower(trimmed)
-	if !strings.HasPrefix(lowerPrefix, "http://") && !strings.HasPrefix(lowerPrefix, "https://") {
-		scheme := "https://"
-		if insecureValue(cfg.Insecure) {
-			scheme = "http://"
-		}
-		urlString = scheme + trimmed
-	}
-	parsed, err := url.Parse(urlString)
+	urlString, err := wire.NormalizeGenerationExportURL(cfg.Endpoint, insecureValue(cfg.Insecure))
 	if err != nil {
-		return nil, fmt.Errorf("parse generation export endpoint %q: %w", cfg.Endpoint, err)
+		return nil, err
 	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("endpoint %q has empty host", cfg.Endpoint)
-	}
-	if parsed.Path == "" || parsed.Path == "/" {
-		parsed.Path = httpGenerationExportPath
-	}
-	urlString = parsed.String()
 
+	// Resolve the User-Agent the same way the gRPC exporter does: a non-blank
+	// caller override wins, otherwise the SDK default. headers has any
+	// User-Agent entry removed so it can't blank out the resolved value below.
+	userAgent, headers := splitUserAgent(cfg.Headers)
 	return &httpGenerationExporter{
-		endpoint: urlString,
-		headers:  cloneTags(cfg.Headers),
+		endpoint:  urlString,
+		userAgent: userAgent,
+		headers:   headers,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -171,7 +178,7 @@ func newHTTPGenerationExporter(cfg GenerationExportConfig) (generationExporter, 
 }
 
 func (e *httpGenerationExporter) Export(ctx context.Context, request *sigilv1.ExportGenerationsRequest) (*sigilv1.ExportGenerationsResponse, error) {
-	payload, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(request)
+	payload, err := wire.MarshalExportGenerationsJSON(request)
 	if err != nil {
 		return nil, fmt.Errorf("marshal generation request: %w", err)
 	}
@@ -180,7 +187,8 @@ func (e *httpGenerationExporter) Export(ctx context.Context, request *sigilv1.Ex
 	if err != nil {
 		return nil, fmt.Errorf("build generation request: %w", err)
 	}
-	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Content-Type", wire.ContentTypeJSON)
+	httpRequest.Header.Set("User-Agent", e.userAgent)
 	for key, value := range e.headers {
 		httpRequest.Header.Set(key, value)
 	}
@@ -201,12 +209,12 @@ func (e *httpGenerationExporter) Export(ctx context.Context, request *sigilv1.Ex
 		return nil, fmt.Errorf("http generation export status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var exportResponse sigilv1.ExportGenerationsResponse
-	if err := protojson.Unmarshal(body, &exportResponse); err != nil {
+	exportResponse, err := wire.UnmarshalExportGenerationsResponseJSON(body)
+	if err != nil {
 		return nil, fmt.Errorf("unmarshal generation response: %w", err)
 	}
 
-	return &exportResponse, nil
+	return exportResponse, nil
 }
 
 func (e *httpGenerationExporter) Shutdown(_ context.Context) error {
@@ -559,7 +567,7 @@ func (c *Client) exportWithRetry(request *sigilv1.ExportGenerationsRequest) erro
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
+	for attempt := range attempts {
 		timeoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		response, err := c.exporter.Export(timeoutCtx, request)
 		cancel()

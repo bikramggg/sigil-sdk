@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/grafana/sigil-sdk/go/sigil/sigilmodel"
 )
 
 // ContentCaptureMode controls what content is included in exported generation
@@ -33,13 +35,37 @@ const (
 	// responsible for ensuring these maps do not contain sensitive content
 	// when using MetadataOnly mode.
 	ContentCaptureModeMetadataOnly
+	// ContentCaptureModeFullWithMetadataSpans splits the proto and span paths
+	// for generation content. Use this mode when the gRPC ingest destination is
+	// private but the OTel traces/metrics destination is shared and must not
+	// receive any content.
+	//
+	// Per-entity behaviour:
+	//   - Generation: full content goes to the gRPC export; the generation span
+	//     omits sigil.conversation.title.
+	//   - ToolExecution: there is no separate gRPC export — the tool execution
+	//     span omits gen_ai.tool.call.arguments, gen_ai.tool.call.result, and
+	//     sigil.conversation.title. Equivalent to MetadataOnly for tool spans.
+	//   - Embedding: there is no separate gRPC export — the embedding span
+	//     omits gen_ai.embeddings.input_texts. Equivalent to MetadataOnly for
+	//     embedding spans.
+	//   - Rating: the Rating.Comment field is preserved; only MetadataOnly
+	//     strips it.
+	//
+	// EmbeddingStart has no per-call ContentCapture field; embedding input
+	// text capture is gated by EmbeddingCaptureConfig.CaptureInput and the
+	// effective client mode from ContentCaptureResolver and Config.ContentCapture.
+	ContentCaptureModeFullWithMetadataSpans
 )
 
 const (
-	metadataKeyContentCaptureMode        = "sigil.sdk.content_capture_mode"
-	contentCaptureModeValueFull          = "full"
-	contentCaptureModeValueNoToolContent = "no_tool_content"
-	contentCaptureModeValueMetaOnly      = "metadata_only"
+	// Pinned to sigilmodel so the shared validator and SDK stripping logic stay
+	// in lockstep.
+	metadataKeyContentCaptureMode                = sigilmodel.MetadataKeyContentCaptureMode
+	contentCaptureModeValueMetaOnly              = sigilmodel.ContentCaptureModeMetadataOnly
+	contentCaptureModeValueFull                  = "full"
+	contentCaptureModeValueNoToolContent         = "no_tool_content"
+	contentCaptureModeValueFullWithMetadataSpans = "full_with_metadata_spans"
 )
 
 // resolveContentCaptureMode returns the effective mode from an override and a
@@ -54,7 +80,7 @@ func resolveContentCaptureMode(override, fallback ContentCaptureMode) ContentCap
 // callContentCaptureResolver invokes the resolver callback safely, recovering
 // from panics. Returns ContentCaptureModeDefault when the resolver is nil.
 // Panics are treated as ContentCaptureModeMetadataOnly (fail-closed).
-func callContentCaptureResolver(resolver func(ctx context.Context, metadata map[string]any) ContentCaptureMode, ctx context.Context, metadata map[string]any) (mode ContentCaptureMode) {
+func callContentCaptureResolver(ctx context.Context, resolver func(ctx context.Context, metadata map[string]any) ContentCaptureMode, metadata map[string]any) (mode ContentCaptureMode) {
 	if resolver == nil {
 		return ContentCaptureModeDefault
 	}
@@ -83,16 +109,6 @@ func stampContentCaptureMetadata(g *Generation, mode ContentCaptureMode) {
 		g.Metadata = map[string]any{}
 	}
 	g.Metadata[metadataKeyContentCaptureMode] = mode.String()
-}
-
-// isContentStripped reports whether the generation has been through MetadataOnly
-// stripping, based on the stamped metadata marker.
-func isContentStripped(g Generation) bool {
-	if g.Metadata == nil {
-		return false
-	}
-	v, _ := g.Metadata[metadataKeyContentCaptureMode].(string)
-	return v == contentCaptureModeValueMetaOnly
 }
 
 // stripContent removes sensitive content from a generation while preserving
@@ -164,6 +180,8 @@ func (m ContentCaptureMode) String() string {
 		return contentCaptureModeValueNoToolContent
 	case ContentCaptureModeMetadataOnly:
 		return contentCaptureModeValueMetaOnly
+	case ContentCaptureModeFullWithMetadataSpans:
+		return contentCaptureModeValueFullWithMetadataSpans
 	default:
 		return "default"
 	}
@@ -183,6 +201,8 @@ func (m *ContentCaptureMode) UnmarshalText(text []byte) error {
 		*m = ContentCaptureModeNoToolContent
 	case contentCaptureModeValueMetaOnly:
 		*m = ContentCaptureModeMetadataOnly
+	case contentCaptureModeValueFullWithMetadataSpans:
+		*m = ContentCaptureModeFullWithMetadataSpans
 	case "default", "":
 		*m = ContentCaptureModeDefault
 	default:

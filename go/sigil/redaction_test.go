@@ -185,15 +185,18 @@ func TestSecretRedactionSanitizerInputRedactionByRole(t *testing.T) {
 	cases := []struct {
 		name             string
 		opts             SecretRedactionOptions
+		env              map[string]string
 		wantUserRedacted bool
 	}{
 		{name: "default preserves user only", opts: SecretRedactionOptions{}, wantUserRedacted: false},
-		{name: "opt-in redacts user too", opts: SecretRedactionOptions{RedactInputMessages: true}, wantUserRedacted: true},
+		{name: "opt-in redacts user too", opts: SecretRedactionOptions{RedactInputMessages: boolPtr(true)}, wantUserRedacted: true},
+		{name: "env enables when option nil", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "true"}, wantUserRedacted: true},
+		{name: "explicit false beats env true", opts: SecretRedactionOptions{RedactInputMessages: boolPtr(false)}, env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "true"}, wantUserRedacted: false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			sanitized := NewSecretRedactionSanitizer(tc.opts)(build())
+			sanitized := newSecretRedactionSanitizer(mapLookup(tc.env), tc.opts)(build())
 
 			userText := sanitized.Input[0].Parts[0].Text
 			if tc.wantUserRedacted {
@@ -457,6 +460,67 @@ func TestGenerationSanitizerClearingTitleDoesNotLeak(t *testing.T) {
 	}
 }
 
+func TestGenerationSanitizerUnderFullWithMetadataSpansOmitsSpanTitle(t *testing.T) {
+	var calls int
+	client, recorder, _ := newTestClient(t, Config{
+		ContentCapture: ContentCaptureModeFullWithMetadataSpans,
+		GenerationSanitizer: func(g Generation) Generation {
+			calls++
+			return g
+		},
+	})
+
+	_, rec := client.StartGeneration(context.Background(), GenerationStart{
+		Model:             ModelRef{Provider: "openai", Name: "gpt-5"},
+		ConversationTitle: "Sensitive title",
+	})
+	rec.SetResult(Generation{
+		Output: []Message{{Role: RoleAssistant, Parts: []Part{{Kind: PartKindText, Text: "ok"}}}},
+		Usage:  TokenUsage{InputTokens: 1, OutputTokens: 1},
+	}, nil)
+	rec.End()
+
+	if err := rec.Err(); err != nil {
+		t.Fatalf("recorder error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected sanitizer to run once, got %d", calls)
+	}
+	span := onlyGenerationSpan(t, recorder.Ended())
+	if _, ok := spanAttributeMap(span)[spanAttrConversationTitle]; ok {
+		t.Errorf("expected %q to be absent under FullWithMetadataSpans even when sanitizer runs", spanAttrConversationTitle)
+	}
+}
+
+func TestGenerationSanitizerPanicUnderFullWithMetadataSpansOmitsSpanTitle(t *testing.T) {
+	var buf bytes.Buffer
+	client, recorder, _ := newTestClient(t, Config{
+		Logger:         log.New(&buf, "", 0),
+		ContentCapture: ContentCaptureModeFullWithMetadataSpans,
+		GenerationSanitizer: func(_ Generation) Generation {
+			panic("boom")
+		},
+	})
+
+	_, rec := client.StartGeneration(context.Background(), GenerationStart{
+		Model:             ModelRef{Provider: "openai", Name: "gpt-5"},
+		ConversationTitle: "Sensitive title",
+	})
+	rec.SetResult(Generation{
+		Output: []Message{{Role: RoleAssistant, Parts: []Part{{Kind: PartKindText, Text: "ok"}}}},
+		Usage:  TokenUsage{InputTokens: 1, OutputTokens: 1},
+	}, nil)
+	rec.End()
+
+	if err := rec.Err(); err != nil {
+		t.Fatalf("recorder error: %v", err)
+	}
+	span := onlyGenerationSpan(t, recorder.Ended())
+	if _, ok := spanAttributeMap(span)[spanAttrConversationTitle]; ok {
+		t.Errorf("expected %q to be absent under FullWithMetadataSpans when sanitizer panics", spanAttrConversationTitle)
+	}
+}
+
 func TestGenerationSanitizerSkippedInMetadataOnlyMode(t *testing.T) {
 	var calls int
 	client, _, _ := newTestClient(t, Config{
@@ -484,4 +548,34 @@ func TestGenerationSanitizerSkippedInMetadataOnlyMode(t *testing.T) {
 func metaString(g Generation, key string) string {
 	v, _ := g.Metadata[key].(string)
 	return v
+}
+
+func TestResolveRedactInputMessages(t *testing.T) {
+	cases := []struct {
+		name     string
+		explicit *bool
+		env      map[string]string
+		want     bool
+	}{
+		{name: "nil and unset defaults to false", want: false},
+		{name: "explicit true wins over unset env", explicit: boolPtr(true), want: true},
+		{name: "explicit false wins over env true", explicit: boolPtr(false), env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "true"}, want: false},
+		{name: "explicit true wins over env false", explicit: boolPtr(true), env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "false"}, want: true},
+		{name: "env true when option nil", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "true"}, want: true},
+		{name: "env false when option nil", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "false"}, want: false},
+		{name: "env 1 parses true", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "1"}, want: true},
+		{name: "env ON case-insensitive", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "ON"}, want: true},
+		{name: "env yes parses true", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "yes"}, want: true},
+		{name: "env off parses false", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "off"}, want: false},
+		{name: "blank env falls back to false", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "   "}, want: false},
+		{name: "invalid env falls back to false", env: map[string]string{"SIGIL_REDACT_INPUT_MESSAGES": "maybe"}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveRedactInputMessages(mapLookup(tc.env), tc.explicit); got != tc.want {
+				t.Errorf("resolveRedactInputMessages = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

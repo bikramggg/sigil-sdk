@@ -4,15 +4,18 @@ Send conversations from your coding agent to [Grafana AI Observability](https://
 
 > AI Observability is in [public preview](https://grafana.com/docs/release-life-cycle/).
 
-## Fastest start (Claude Code or pi)
+## Fastest start (Claude Code, Codex, Copilot, OpenCode, or pi)
 
 ```sh
 brew install grafana/grafana/sigil
 sigil claude     # for Claude Code
+sigil codex      # for Codex
+sigil copilot    # for Copilot CLI
+sigil opencode   # for OpenCode
 sigil pi         # for pi
 ```
 
-The launcher installs the plugin on first run. Add your credentials to `~/.config/sigil/config.env` — see any per-agent README for the 3-page Grafana Cloud walkthrough.
+Use the `sigil <agent>` launcher for setup and daily use. On first run it installs the agent plugin or extension, prompts for missing Grafana Cloud credentials, writes `~/.config/sigil/config.env`, and then launches the agent.
 
 ## All plugins
 
@@ -20,8 +23,9 @@ The launcher installs the plugin on first run. Add your credentials to `~/.confi
 |-------|--------|--------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`claude-code/`](claude-code/) | Available |
 | [Codex](https://developers.openai.com/codex) | [`codex/`](codex/) | Experimental |
+| [Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli/using-github-copilot-in-the-cli) | [`copilot/`](copilot/) | Experimental |
 | [Cursor](https://cursor.com) | [`cursor/`](cursor/) | Available |
 | [OpenCode](https://opencode.ai) | [`opencode/`](opencode/) | Available |
 | [Pi](https://github.com/badlogic/pi) | [`pi/`](pi/) | Available |
 
-Claude Code, Codex, and Cursor share the same Go binary (`brew install grafana/grafana/sigil`) and the same config file (`~/.config/sigil/config.env`). All Sigil connection details live at `https://<your-grafana>.grafana.net/plugins/grafana-sigil-app`.
+Plugins backed by the `sigil` launcher share one config file at `~/.config/sigil/config.env`. The launcher creates or updates it on first run; `sigil login` re-runs the same prompt later. Cursor has no launcher, so register its plugin in-app and run `sigil login` once for the shared config.

@@ -1,18 +1,45 @@
-# Grafana Sigil Go SDK (Core)
+# Grafana Sigil Go SDK
 
-If you already use OpenTelemetry, Sigil is a thin extension plus sugar for AI observability.
+The Sigil Go SDK records LLM generations and tool calls for [Grafana AI observability](https://grafana.com/docs/grafana-cloud/machine-learning/ai-observability/). It emits OpenTelemetry spans and metrics through your existing OTel setup and sends normalized generation payloads through Sigil's ingest channel.
 
-The Go SDK is the current production-ready baseline for normalized generation recording with OTEL traces and generation-first export.
+## Install
 
-Cross-language parity tracks are available for:
+```sh
+go get github.com/grafana/sigil-sdk/go
+```
 
-- Python: `python/`
-- TypeScript/JavaScript: `js/`
-- .NET/C#: `dotnet/`
+## Quick start
 
-Framework modules:
+```go
+client := sigil.NewClient(sigil.Config{}) // reads SIGIL_* env vars
+defer func() { _ = client.Shutdown(context.Background()) }()
 
-- Google ADK helper: [`go-frameworks/google-adk`](../go-frameworks/google-adk/README.md)
+ctx, rec := client.StartGeneration(ctx, sigil.GenerationStart{
+	ConversationID: "conv-9b2f",
+	AgentName:      "assistant-core",
+	AgentVersion:   "1.0.0",
+	Model:          sigil.ModelRef{Provider: "anthropic", Name: "claude-sonnet-4-5"},
+})
+defer rec.End()
+
+resp, err := provider.Call(ctx, req)
+if err != nil {
+	rec.SetCallError(err)
+	return err
+}
+
+rec.SetResult(sigil.Generation{
+	Input:  []sigil.Message{sigil.UserTextMessage("Hello")},
+	Output: []sigil.Message{sigil.AssistantTextMessage(resp.Text)},
+	Usage:  sigil.TokenUsage{InputTokens: 120, OutputTokens: 42},
+}, nil)
+```
+
+See `Configuration` for the explicit-config form and `Recording API` for the full surface.
+
+Framework helpers:
+
+- Google ADK: [`go-frameworks/google-adk`](../go-frameworks/google-adk/README.md)
 
 ## Core model
 
@@ -178,12 +205,56 @@ cfg.GenerationExport.Auth = sigil.AuthConfig{
 }
 ```
 
-## Env-secret wiring example
+## Hooks and Guards
 
-The SDK does not auto-load env vars. Read env values in your app and assign config explicitly.
+Use hooks when you want Sigil guard rules to run before an LLM call. The SDK evaluates the hook on your request path; guard rules configured in Grafana Cloud decide whether to allow, deny, or transform the input.
+
+Hooks are disabled by default. Enable them on the client and call `EvaluateHook(...)` before the provider request:
 
 ```go
-genToken := strings.TrimSpace(os.Getenv("SIGIL_GEN_BEARER_TOKEN"))
+cfg := sigil.DefaultConfig()
+cfg.Hooks.Enabled = true
+cfg.Hooks.Phases = []sigil.HookPhase{sigil.HookPhasePreflight}
+
+client := sigil.NewClient(cfg)
+
+messages := []sigil.Message{
+	sigil.UserTextMessage("Summarize this customer note..."),
+}
+response, err := client.EvaluateHook(ctx, sigil.HookEvaluateRequest{
+	Phase: sigil.HookPhasePreflight,
+	Context: sigil.HookContext{
+		AgentName:    "support-agent",
+		AgentVersion: "1.0.0",
+		Model:        &sigil.HookModel{Provider: "openai", Name: "gpt-5"},
+	},
+	Input: sigil.HookInput{
+		Messages:            messages,
+		SystemPrompt:        "You are a helpful support agent.",
+		ConversationPreview: "Summarize this customer note...",
+	},
+})
+if err != nil {
+	return err
+}
+if err := sigil.HookDeniedFromResponse(response); err != nil {
+	return err
+}
+if response.TransformedInput != nil && len(response.TransformedInput.Messages) > 0 {
+	messages = response.TransformedInput.Messages
+}
+```
+
+`HooksConfig` defaults to `Phases: []HookPhase{HookPhasePreflight}`, `Timeout: 15s`, and fail-open behavior. With fail-open enabled, hook transport errors resolve to allow so an unavailable evaluator does not block production traffic. Set `FailOpen` to `sigil.BoolPtr(false)` for strict paths that should fail closed.
+
+If you use transformed input, pass the transformed messages/system prompt to the provider and record those same values in `StartGeneration(...)`. For a runnable example, see [`../examples/getting-started/go-hooks/`](../examples/getting-started/go-hooks/).
+
+## Wiring custom env vars
+
+The SDK only auto-loads `SIGIL_*` env vars (`SIGIL_ENDPOINT`, `SIGIL_PROTOCOL`, `SIGIL_AUTH_MODE`, `SIGIL_AUTH_TOKEN`, etc.) when you call `sigil.NewClient(sigil.Config{})`. For any other env var (for example one your secret manager exposes under a different name), read it in your app and pass the value into the config:
+
+```go
+genToken := strings.TrimSpace(os.Getenv("MY_APP_SIGIL_TOKEN"))
 if genToken != "" {
 	cfg.GenerationExport.Auth = sigil.AuthConfig{
 		Mode:        sigil.ExportAuthModeBearer,
@@ -199,15 +270,82 @@ Common topology:
 - Traces/metrics via OTEL Collector/Alloy: configure exporters in your app OTEL SDK setup.
 - Enterprise proxy: generation `bearer` mode to proxy; proxy authenticates and forwards tenant header upstream.
 
+## Content Capture Mode
+
+`ContentCaptureMode` controls what content the SDK includes in exported generation payloads and OTel span attributes. See [Content Capture Modes](../docs/concepts/content-capture-modes.md) for the canonical mode matrix and defaults; the snippets below show how to wire it up in Go.
+
+Client-level default:
+
+```go
+cfg := sigil.DefaultConfig()
+cfg.ContentCapture = sigil.ContentCaptureModeMetadataOnly
+
+client := sigil.NewClient(cfg)
+defer func() { _ = client.Shutdown(context.Background()) }()
+```
+
+The core SDK client treats `ContentCaptureModeDefault` as `ContentCaptureModeNoToolContent`: generation content is captured but tool-execution arguments and results stay out of spans.
+
+Per-generation override:
+
+```go
+ctx, rec := client.StartGeneration(ctx, sigil.GenerationStart{
+    Model:          sigil.ModelRef{Provider: "openai", Name: "gpt-5"},
+    ContentCapture: sigil.ContentCaptureModeFull,
+})
+defer rec.End()
+```
+
+Per-tool-execution override (here `Full` opts into capturing tool arguments and results in the span):
+
+```go
+ctx, tool := client.StartToolExecution(ctx, sigil.ToolExecutionStart{
+    ToolName:       "search",
+    ContentCapture: sigil.ContentCaptureModeFull,
+})
+defer tool.End()
+```
+
+Tool executions also inherit the parent generation's resolved mode via context, so explicit overrides are rarely needed inside an instrumented generation block.
+
+Dynamic resolution via `ContentCaptureResolver`:
+
+```go
+cfg.ContentCaptureResolver = func(ctx context.Context, metadata map[string]any) sigil.ContentCaptureMode {
+    if metadata["sigil.tenant"] == "healthcare" {
+        return sigil.ContentCaptureModeMetadataOnly
+    }
+    return sigil.ContentCaptureModeDefault // defer to Config.ContentCapture
+}
+```
+
+Resolver panics are recovered and treated as `ContentCaptureModeMetadataOnly` (fail-closed).
+
+Resolution precedence for generations (highest to lowest):
+
+1. Per-generation `ContentCapture`
+2. `ContentCaptureResolver` return value
+3. `Config.ContentCapture` (defaults to `ContentCaptureModeNoToolContent`)
+
+Resolution precedence for tool executions (highest to lowest):
+
+1. Per-tool `ContentCapture`
+2. Parent generation's resolved mode, propagated through `context.Context`
+3. `ContentCaptureResolver` return value
+4. `Config.ContentCapture` (defaults to `ContentCaptureModeNoToolContent`)
+
+User-provided `Metadata` and `Tags` are not stripped by any capture mode. SDK-internal metadata keys that carry content (e.g. `call_error`, `sigil.conversation.title`) are stripped along with the matching content.
+
 ## Pre-Ingest Redaction
 
 Use `GenerationSanitizer` when you want to redact substrings from normalized generations before validation, span sync, and export.
 
 ```go
 redactEmails := true
+redactInputs := false
 cfg := sigil.DefaultConfig()
 cfg.GenerationSanitizer = sigil.NewSecretRedactionSanitizer(sigil.SecretRedactionOptions{
-    RedactInputMessages:  false,         // also redact user messages in Generation.Input
+    RedactInputMessages:  &redactInputs, // nil falls back to SIGIL_REDACT_INPUT_MESSAGES, then false
     RedactEmailAddresses: &redactEmails, // nil defaults to true; point to false to preserve
 })
 
@@ -220,7 +358,7 @@ The built-in sanitizer:
 - redacts secret formats plus env-style secret values in tool call inputs and tool results
 - redacts email addresses by default
 - redacts historic assistant turns and tool messages in `Generation.Input`
-- leaves user messages in `Generation.Input` unchanged unless `RedactInputMessages: true` is set
+- leaves user messages in `Generation.Input` unchanged unless input redaction is enabled
 
 To preserve email addresses, opt out explicitly:
 
@@ -232,6 +370,15 @@ cfg.GenerationSanitizer = sigil.NewSecretRedactionSanitizer(sigil.SecretRedactio
 ```
 
 If a sanitizer panics during `Recorder.End`, the SDK falls back to `ContentCaptureModeMetadataOnly` for that generation and logs a warning via `Config.Logger`, so a partially redacted payload is never shipped.
+
+### Configuring redaction via environment variables
+
+`NewSecretRedactionSanitizer` reads `SIGIL_REDACT_INPUT_MESSAGES` (accepts `1/0`, `true/false`, `yes/no`, `on/off`) when `RedactInputMessages` is left nil. Precedence is explicit option > env var > `false`. An unrecognised env value is logged via the standard logger and ignored, so a typo falls back to the next layer instead of silently flipping redaction.
+
+```go
+// Leave RedactInputMessages nil so SIGIL_REDACT_INPUT_MESSAGES decides.
+cfg.GenerationSanitizer = sigil.NewSecretRedactionSanitizer(sigil.SecretRedactionOptions{})
+```
 
 ## Conversation Ratings
 
@@ -270,39 +417,6 @@ The SDK emits four OTel histograms automatically through your configured OTel me
 - `gen_ai.client.token.usage`
 - `gen_ai.client.time_to_first_token`
 - `gen_ai.client.tool_calls_per_operation`
-
-## Conformance harness
-
-The Go SDK ships a local no-Docker conformance harness for the current cross-SDK baseline.
-
-- Shared spec: `docs/references/sdk-conformance-spec.md` (in the sigil repo)
-- Default local command: `mise run sdk:conformance`
-- Direct Go command: `cd go && GOWORK=off go test ./sigil -run '^TestConformance' -count=1`
-- Current baseline coverage: sync roundtrip, conversation title resolution, user ID resolution, agent name/version resolution, streaming mode + TTFT, tool execution, embeddings, validation/error handling, rating submission, and shutdown flush semantics across exported generation payloads, OTLP spans, OTLP metrics, and local rating HTTP capture
-
-## Explicit flow example
-
-```go
-ctx, rec := client.StartGeneration(ctx, sigil.GenerationStart{
-	ConversationID: "conv-9b2f",
-	AgentName:      "assistant-core",
-	AgentVersion:   "1.0.0",
-	Model:          sigil.ModelRef{Provider: "anthropic", Name: "claude-sonnet-4-5"},
-})
-defer rec.End()
-
-resp, err := provider.Call(ctx, req)
-if err != nil {
-	rec.SetCallError(err)
-	return err
-}
-
-rec.SetResult(sigil.Generation{
-	Input:  []sigil.Message{sigil.UserTextMessage("Hello")},
-	Output: []sigil.Message{sigil.AssistantTextMessage(resp.Text)},
-	Usage:  sigil.TokenUsage{InputTokens: 120, OutputTokens: 42},
-}, nil)
-```
 
 ## Streaming example
 
@@ -384,3 +498,12 @@ Current Go provider helpers:
 - Default: raw artifacts OFF in provider wrappers.
 - Opt-in only for debug workflows (`WithRawArtifacts()` in provider helper packages).
 - Normalized generation fields remain always on.
+
+## Conformance harness
+
+The Go SDK ships a local no-Docker conformance harness for the current cross-SDK baseline.
+
+- Shared spec: `docs/references/sdk-conformance-spec.md` (in the sigil repo)
+- Default local command: `mise run sdk:conformance`
+- Direct Go command: `cd go && GOWORK=off go test ./sigil -run '^TestConformance' -count=1`
+- Current baseline coverage: sync roundtrip, conversation title resolution, user ID resolution, agent name/version resolution, streaming mode + TTFT, tool execution, embeddings, validation/error handling, rating submission, and shutdown flush semantics across exported generation payloads, OTLP spans, OTLP metrics, and local rating HTTP capture

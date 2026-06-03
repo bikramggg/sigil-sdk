@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SDK_DIR="$(cd "${SCRIPT_DIR}/../../../js" && pwd)"
+mise run build:ts:sdk-js
 
-# Build the SDK so workspace-linked types are available
-if [ ! -f "${SDK_DIR}/dist/index.d.ts" ]; then
-  echo "Building @grafana/sigil-sdk-js..."
-  npx tsc --project "${SDK_DIR}/tsconfig.build.json"
-fi
+pnpm exec tsc --noEmit
 
-tsc --noEmit
-
-npx esbuild src/index.ts \
+pnpm exec esbuild src/index.ts \
   --bundle \
   --format=esm \
   --platform=node \
@@ -21,4 +14,4 @@ npx esbuild src/index.ts \
   --external:@opencode-ai/plugin \
   --external:@opencode-ai/sdk
 
-tsc --project tsconfig.build.json --emitDeclarationOnly --declaration --declarationMap --outDir dist
+pnpm exec tsc --project tsconfig.build.json --emitDeclarationOnly --declaration --declarationMap --outDir dist

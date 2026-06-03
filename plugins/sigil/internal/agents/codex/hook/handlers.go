@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -16,9 +17,12 @@ import (
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/config"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/fragment"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/mapper"
-	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/util"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/guard"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/envconfig"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/otel"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/redact"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/timeutil"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/useragent"
 )
 
 const (
@@ -77,6 +81,49 @@ func UserPromptSubmit(p Payload, cfg config.Config, logger *log.Logger) {
 	}
 }
 
+// PreToolUse evaluates a Codex tool call against Sigil guard rules. It writes
+// a PreToolUse deny envelope to stdout when the call must be blocked and
+// stays silent when the call is allowed. Transport setup, credential checks,
+// and fail-open/closed behaviour live in the shared guard package. Claude
+// Code and Codex also share the PreToolUse deny envelope writer.
+func PreToolUse(ctx context.Context, stdout io.Writer, p Payload, cfg config.Config, logger *log.Logger) {
+	res := guard.EvaluateToolCall(ctx, cfg.Guards, guard.ToolCallInput{
+		AgentName:     mapper.AgentName,
+		ToolName:      p.ToolName,
+		ToolCallID:    p.ToolUseID,
+		ToolInputJSON: p.ToolInput,
+		ModelProvider: guardProviderFromModel(p.Model),
+		ModelName:     p.Model,
+	}, logger)
+	if res.Blocked() {
+		guard.WriteHookSpecificOutputDeny(stdout, res.Reason)
+	}
+}
+
+func guardProviderFromModel(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "claude"):
+		return "anthropic"
+	case strings.HasPrefix(m, "gpt"), isOpenAIOSeriesModel(m):
+		return "openai"
+	case strings.Contains(m, "gemini"):
+		return "google"
+	}
+	return ""
+}
+
+// isOpenAIOSeriesModel reports whether m starts with the OpenAI "o-series"
+// prefix `o` immediately followed by a digit (o1, o3, o4, o5, …). Matching
+// the family rather than a fixed list keeps future releases attributed to
+// OpenAI without code changes.
+func isOpenAIOSeriesModel(m string) bool {
+	if len(m) < 2 || m[0] != 'o' {
+		return false
+	}
+	return m[1] >= '0' && m[1] <= '9'
+}
+
 func PostToolUse(p Payload, cfg config.Config, logger *log.Logger) {
 	if p.SessionID == "" || p.TurnID == "" {
 		logger.Print("postToolUse: missing session_id or turn_id")
@@ -128,6 +175,7 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 		logger.Printf("stop: update: %v", err)
 		return
 	}
+	envconfig.ApplyLocalAuthPlaceholders()
 	if !config.HasCredentials() {
 		logger.Print("stop: missing SIGIL_ENDPOINT/SIGIL_AUTH_TENANT_ID/SIGIL_AUTH_TOKEN; discarding fragment")
 		if err := fragment.Delete(p.SessionID, p.TurnID); err != nil {
@@ -144,7 +192,7 @@ func Stop(p Payload, cfg config.Config, logger *log.Logger) {
 	tokenSnapshot := tokenSnapshotForStop(p, frag, logger)
 	ctx, cancel := context.WithTimeout(context.Background(), stopExportTimeout)
 	defer cancel()
-	providers := setupOTelIfConfigured(ctx, logger)
+	providers := setupOTelIfConfigured(ctx, p.SessionID, logger)
 	if providers != nil {
 		defer func() {
 			if err := providers.Shutdown(ctx); err != nil {
@@ -396,11 +444,11 @@ func applySessionDefaults(f *fragment.Fragment, s *fragment.Session) {
 	}
 }
 
-func setupOTelIfConfigured(ctx context.Context, logger *log.Logger) *otel.Providers {
+func setupOTelIfConfigured(ctx context.Context, instanceID string, logger *log.Logger) *otel.Providers {
 	if otel.EndpointFromEnv() == "" {
 		return nil
 	}
-	providers, err := otel.Setup(ctx)
+	providers, err := otel.Setup(ctx, instanceID)
 	if err != nil {
 		logger.Printf("otel: setup: %v", err)
 		return nil
@@ -408,26 +456,31 @@ func setupOTelIfConfigured(ctx context.Context, logger *log.Logger) *otel.Provid
 	return providers
 }
 
+func exportConfig() sigil.GenerationExportConfig {
+	return sigil.GenerationExportConfig{
+		Protocol:       sigil.GenerationExportProtocolHTTP,
+		Endpoint:       strings.TrimRight(os.Getenv("SIGIL_ENDPOINT"), "/") + "/api/v1/generations:export",
+		Headers:        map[string]string{"User-Agent": useragent.For("codex")},
+		BatchSize:      100,
+		FlushInterval:  100 * time.Millisecond,
+		QueueSize:      16,
+		MaxRetries:     1,
+		InitialBackoff: 50 * time.Millisecond,
+		MaxBackoff:     100 * time.Millisecond,
+		Auth: sigil.AuthConfig{
+			Mode:          sigil.ExportAuthModeBasic,
+			BasicUser:     os.Getenv("SIGIL_AUTH_TENANT_ID"),
+			BasicPassword: os.Getenv("SIGIL_AUTH_TOKEN"),
+			TenantID:      os.Getenv("SIGIL_AUTH_TENANT_ID"),
+		},
+	}
+}
+
 func buildClient(cfg config.Config, providers *otel.Providers, logger *log.Logger) *sigil.Client {
 	c := sigil.Config{
-		ContentCapture: cfg.ContentCapture,
-		Logger:         logger,
-		GenerationExport: sigil.GenerationExportConfig{
-			Protocol:       sigil.GenerationExportProtocolHTTP,
-			Endpoint:       strings.TrimRight(os.Getenv("SIGIL_ENDPOINT"), "/") + "/api/v1/generations:export",
-			BatchSize:      100,
-			FlushInterval:  100 * time.Millisecond,
-			QueueSize:      16,
-			MaxRetries:     1,
-			InitialBackoff: 50 * time.Millisecond,
-			MaxBackoff:     100 * time.Millisecond,
-			Auth: sigil.AuthConfig{
-				Mode:          sigil.ExportAuthModeBasic,
-				BasicUser:     os.Getenv("SIGIL_AUTH_TENANT_ID"),
-				BasicPassword: os.Getenv("SIGIL_AUTH_TOKEN"),
-				TenantID:      os.Getenv("SIGIL_AUTH_TENANT_ID"),
-			},
-		},
+		ContentCapture:   cfg.ContentCapture,
+		Logger:           logger,
+		GenerationExport: exportConfig(),
 	}
 	if providers != nil {
 		c.Tracer = providers.Tracer(otelInstrumentationName)
@@ -495,7 +548,7 @@ func redactSpanContent(red *redact.Redactor, raw json.RawMessage) string {
 }
 
 func toolSpanWindow(t fragment.ToolRecord, genCompletedAt time.Time) (time.Time, time.Time) {
-	completedAt := util.ParseTimestamp(t.CompletedAt, genCompletedAt)
+	completedAt := timeutil.ParseTimestamp(t.CompletedAt, genCompletedAt)
 	startedAt := completedAt
 	if t.DurationMs != nil && !completedAt.IsZero() {
 		startedAt = completedAt.Add(-time.Duration(*t.DurationMs) * time.Millisecond)

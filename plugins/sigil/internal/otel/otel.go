@@ -15,15 +15,19 @@ package otel
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/envconfig"
@@ -105,7 +109,11 @@ func (p *Providers) Shutdown(ctx context.Context) error {
 
 // Setup creates OTLP HTTP trace + metric providers.
 // Returns nil providers (no error) when no OTLP endpoint is configured.
-func Setup(ctx context.Context) (*Providers, error) {
+//
+// instanceID is written to the resource as service.instance.id so concurrent
+// agent sessions on the same host produce distinct OTel resource identities
+// (otherwise cumulative metric series collide). Empty falls back to a UUID.
+func Setup(ctx context.Context, instanceID string) (*Providers, error) {
 	endpoint := EndpointFromEnv()
 	if endpoint == "" {
 		return nil, nil
@@ -125,19 +133,38 @@ func Setup(ctx context.Context) (*Providers, error) {
 	if os.Getenv("OTEL_SERVICE_NAME") == "" {
 		_ = os.Setenv("OTEL_SERVICE_NAME", DefaultServiceName)
 	}
+	if instanceID == "" {
+		instanceID = uuid.NewString()
+	}
+	res, err := sdkresource.Merge(
+		sdkresource.Default(),
+		sdkresource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceInstanceID(instanceID),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build resource: %w", err)
+	}
 	setupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	traceExp, err := otlptracehttp.New(setupCtx, traceOptions(cfg)...)
 	if err != nil {
 		return nil, err
 	}
-	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExp, sdktrace.WithBatchTimeout(time.Second)))
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(traceExp, sdktrace.WithBatchTimeout(time.Second)),
+		sdktrace.WithResource(res),
+	)
 	metricExp, err := otlpmetrichttp.New(setupCtx, metricOptions(cfg)...)
 	if err != nil {
 		_ = tp.Shutdown(ctx)
 		return nil, err
 	}
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(time.Second))))
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(time.Second))),
+		sdkmetric.WithResource(res),
+	)
 	return &Providers{tp: tp, mp: mp}, nil
 }
 
@@ -208,13 +235,13 @@ func envOr(key, fallback string) string {
 
 func parseHeaders(raw string) map[string]string {
 	out := map[string]string{}
-	for _, pair := range strings.Split(raw, ",") {
-		eq := strings.IndexByte(pair, '=')
-		if eq < 0 {
+	for pair := range strings.SplitSeq(raw, ",") {
+		before, after, ok := strings.Cut(pair, "=")
+		if !ok {
 			continue
 		}
-		key := strings.TrimSpace(pair[:eq])
-		value := strings.TrimSpace(pair[eq+1:])
+		key := strings.TrimSpace(before)
+		value := strings.TrimSpace(after)
 		if key != "" && value != "" {
 			out[key] = value
 		}
@@ -230,4 +257,3 @@ func hasAuthorizationHeader(headers map[string]string) bool {
 	}
 	return false
 }
-

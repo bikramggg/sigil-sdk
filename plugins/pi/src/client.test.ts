@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SigilPiConfig } from "./config.js";
 
+const { loggerMock } = vi.hoisted(() => ({
+  loggerMock: { debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock("./logger.js", () => ({ logger: loggerMock }));
+
 const { SigilClientMock, createSecretRedactionSanitizerMock, SANITIZER } =
   vi.hoisted(() => {
     const sanitizer = Object.assign(() => ({}) as never, {
@@ -16,6 +22,7 @@ const { SigilClientMock, createSecretRedactionSanitizerMock, SANITIZER } =
 vi.mock("@grafana/sigil-sdk-js", () => ({
   SigilClient: SigilClientMock,
   createSecretRedactionSanitizer: createSecretRedactionSanitizerMock,
+  userAgent: () => "sigil-sdk-js/0.0.0-test",
 }));
 
 import { createSigilClient } from "./client.js";
@@ -26,12 +33,7 @@ function makeConfig(overrides?: Partial<SigilPiConfig>): SigilPiConfig {
     auth: { mode: "none" },
     agentName: "pi",
     contentCapture: "metadata_only",
-    debug: false,
-    redaction: {
-      enabled: true,
-      redactInputMessages: true,
-      redactEmailAddresses: true,
-    },
+    redactInputMessages: true,
     guards: {
       enabled: false,
       timeoutMs: 1500,
@@ -45,16 +47,17 @@ describe("createSigilClient", () => {
   beforeEach(() => {
     SigilClientMock.mockReset();
     createSecretRedactionSanitizerMock.mockClear();
+    loggerMock.debug.mockReset();
+    loggerMock.warn.mockReset();
+    loggerMock.error.mockReset();
     // biome-ignore lint/complexity/useArrowFunction: must be a regular function for `new` to work
     SigilClientMock.mockImplementation(function () {
       return {};
     });
   });
 
-  it("creates sdk client with tenant auth", () => {
-    const client = createSigilClient(
-      makeConfig({ auth: { mode: "tenant", tenantId: "t-1" } }),
-    );
+  it("creates sdk client with no auth", () => {
+    const client = createSigilClient(makeConfig());
 
     expect(client).toEqual({});
     expect(SigilClientMock).toHaveBeenCalledTimes(1);
@@ -62,7 +65,12 @@ describe("createSigilClient", () => {
       generationExport: {
         protocol: "http",
         endpoint: "http://localhost:8080/api/v1/generations:export",
-        auth: { mode: "tenant", tenantId: "t-1" },
+        auth: { mode: "none" },
+        headers: {
+          "User-Agent": expect.stringMatching(
+            /^sigil-plugin-pi\/.+ sigil-sdk-js\/0\.0\.0-test$/,
+          ),
+        },
       },
       api: { endpoint: "http://localhost:8080" },
       hooks: {
@@ -75,6 +83,15 @@ describe("createSigilClient", () => {
       logger: expect.any(Object),
       generationSanitizer: SANITIZER,
     });
+  });
+
+  it("sets the plugin User-Agent on the generation export", () => {
+    createSigilClient(makeConfig());
+
+    const [arg] = SigilClientMock.mock.calls[0]!;
+    const ua = arg.generationExport.headers["User-Agent"];
+    expect(ua.startsWith("sigil-plugin-pi/")).toBe(true);
+    expect(ua.endsWith("sigil-sdk-js/0.0.0-test")).toBe(true);
   });
 
   it("appends the export path for a prefix-mounted endpoint", () => {
@@ -91,13 +108,13 @@ describe("createSigilClient", () => {
     );
   });
 
-  it("maps basic auth to sdk format with tenantId", () => {
+  it("passes basic auth through with tenantId", () => {
     createSigilClient(
       makeConfig({
         auth: {
           mode: "basic",
-          user: "12345",
-          password: "pass",
+          basicUser: "12345",
+          basicPassword: "pass",
           tenantId: "12345",
         },
       }),
@@ -112,6 +129,11 @@ describe("createSigilClient", () => {
           basicUser: "12345",
           basicPassword: "pass",
           tenantId: "12345",
+        },
+        headers: {
+          "User-Agent": expect.stringMatching(
+            /^sigil-plugin-pi\/.+ sigil-sdk-js\/0\.0\.0-test$/,
+          ),
         },
       },
       api: { endpoint: "http://localhost:8080" },
@@ -158,50 +180,32 @@ describe("createSigilClient", () => {
     );
   });
 
-  it("uses warn as the default sdk log level", () => {
-    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      createSigilClient(makeConfig());
-      const [{ logger }] = SigilClientMock.mock.calls[0]!;
-      logger.debug("debug");
-      logger.warn("warn");
-      logger.error("error");
+  it("routes sdk logs through the file logger by level", () => {
+    createSigilClient(makeConfig());
+    const [{ logger }] = SigilClientMock.mock.calls[0]!;
+    logger.debug("debug");
+    logger.warn("warn");
+    logger.error("error");
 
-      expect(debug).not.toHaveBeenCalled();
-      expect(warn).toHaveBeenCalledWith("[sigil-pi] warn");
-      expect(error).toHaveBeenCalledWith("[sigil-pi] error");
-    } finally {
-      debug.mockRestore();
-      warn.mockRestore();
-      error.mockRestore();
-    }
+    expect(loggerMock.debug).toHaveBeenCalledWith("debug");
+    expect(loggerMock.warn).toHaveBeenCalledWith("warn");
+    expect(loggerMock.error).toHaveBeenCalledWith("error");
   });
 
   it("downgrades best-effort export sdk logs to debug", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      createSigilClient(makeConfig());
-      const [{ logger: defaultLogger }] = SigilClientMock.mock.calls[0]!;
-      defaultLogger.warn("sigil generation export failed: transport down");
-      defaultLogger.warn("sigil generation rejected id=g-1: invalid");
+    createSigilClient(makeConfig());
+    const [{ logger }] = SigilClientMock.mock.calls[0]!;
+    logger.warn("sigil generation export failed: transport down");
+    logger.warn("sigil generation rejected id=g-1: invalid");
 
-      expect(warn).not.toHaveBeenCalled();
-      expect(error).not.toHaveBeenCalled();
-
-      createSigilClient(makeConfig({ debug: true }));
-      const [{ logger: debugLogger }] = SigilClientMock.mock.calls[1]!;
-      debugLogger.warn("sigil generation export failed: transport down");
-
-      expect(error).toHaveBeenCalledWith(
-        "[sigil-pi] sigil generation export failed: transport down",
-      );
-    } finally {
-      warn.mockRestore();
-      error.mockRestore();
-    }
+    // Best-effort export failures are demoted to debug, never warn.
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(loggerMock.debug).toHaveBeenCalledWith(
+      "sigil generation export failed: transport down",
+    );
+    expect(loggerMock.debug).toHaveBeenCalledWith(
+      "sigil generation rejected id=g-1: invalid",
+    );
   });
 
   it("returns null when sdk constructor throws", () => {
@@ -213,50 +217,15 @@ describe("createSigilClient", () => {
     expect(client).toBeNull();
   });
 
-  it("wires generationSanitizer when redaction is enabled", () => {
-    createSigilClient(makeConfig());
+  it("wires input redaction into the sanitizer", () => {
+    createSigilClient(makeConfig({ redactInputMessages: false }));
 
     expect(createSecretRedactionSanitizerMock).toHaveBeenCalledTimes(1);
     expect(createSecretRedactionSanitizerMock).toHaveBeenCalledWith({
-      redactInputMessages: true,
-      redactEmailAddresses: true,
+      redactInputMessages: false,
     });
     expect(SigilClientMock).toHaveBeenCalledWith(
       expect.objectContaining({ generationSanitizer: SANITIZER }),
-    );
-  });
-
-  it("forwards redaction sub-flags to the sanitizer factory", () => {
-    createSigilClient(
-      makeConfig({
-        redaction: {
-          enabled: true,
-          redactInputMessages: false,
-          redactEmailAddresses: false,
-        },
-      }),
-    );
-
-    expect(createSecretRedactionSanitizerMock).toHaveBeenCalledWith({
-      redactInputMessages: false,
-      redactEmailAddresses: false,
-    });
-  });
-
-  it("omits generationSanitizer when redaction is disabled", () => {
-    createSigilClient(
-      makeConfig({
-        redaction: {
-          enabled: false,
-          redactInputMessages: true,
-          redactEmailAddresses: true,
-        },
-      }),
-    );
-
-    expect(createSecretRedactionSanitizerMock).not.toHaveBeenCalled();
-    expect(SigilClientMock).toHaveBeenCalledWith(
-      expect.objectContaining({ generationSanitizer: undefined }),
     );
   });
 });

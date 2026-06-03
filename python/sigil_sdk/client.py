@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import secrets
 import threading
@@ -20,6 +21,7 @@ from opentelemetry import metrics, trace
 from opentelemetry.metrics import Histogram
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode, use_span
 
+from . import experiments as _experiments
 from .config import ClientConfig, resolve_config
 from .context import (
     _pop_capture_mode,
@@ -48,10 +50,15 @@ from .models import (
     ConversationRatingInput,
     ConversationRatingSummary,
     ConversationRatingValue,
+    CreateExperimentRequest,
     EmbeddingResult,
     EmbeddingStart,
     ExecuteToolCallsOptions,
+    Experiment,
+    ExperimentReport,
+    ExperimentStatus,
     ExportGenerationsRequest,
+    ExportScoresResponse,
     ExportWorkflowStepsRequest,
     Generation,
     GenerationMode,
@@ -59,10 +66,12 @@ from .models import (
     Message,
     MessageRole,
     PartKind,
+    ScoreItem,
     SubmitConversationRatingResponse,
     ToolExecutionEnd,
     ToolExecutionStart,
     ToolResult,
+    UpdateExperimentRequest,
     WorkflowStep,
     _metadata_key_content_capture_mode,
     tool_result_part,
@@ -416,6 +425,21 @@ class Client:
         started_at = _to_utc(seed.started_at) if seed.started_at is not None else _to_utc(self._now())
         seed.started_at = started_at
 
+        # Resolve the effective content capture mode so a per-call resolver
+        # can hide ``gen_ai.embeddings.input_texts`` at the span layer.
+        # Embeddings gate on client config + resolver only.
+        # ``with_content_capture_mode`` is intentionally NOT consulted here:
+        # embeddings have no per-call mode override in Go/Java/JS/.NET, and
+        # Python keeps the same shape. Generations and tools still honor
+        # ``with_content_capture_mode`` (see ``_start_generation`` and
+        # ``start_tool_execution``).
+        resolver_mode = _call_content_capture_resolver(
+            self._config.content_capture_resolver, seed.metadata, self._config.logger
+        )
+        embedding_mode = _resolve_client_content_capture_mode(
+            _resolve_content_capture_mode(resolver_mode, self._config.content_capture)
+        )
+
         span = self._tracer.start_span(
             _embedding_span_name(seed.model.name),
             kind=SpanKind.CLIENT,
@@ -428,6 +452,7 @@ class Client:
             seed=seed,
             span=span,
             started_at=started_at,
+            _content_capture_mode=embedding_mode,
         )
 
     def start_tool_execution(self, start: ToolExecutionStart) -> ToolExecutionRecorder:
@@ -468,8 +493,15 @@ class Client:
         ctx_mode = content_capture_mode_from_context()
         tool_mode = _resolve_tool_content_capture_mode(seed.content_capture, ctx_mode, effective_client_default)
 
-        if tool_mode == ContentCaptureMode.METADATA_ONLY:
+        if tool_mode in (
+            ContentCaptureMode.METADATA_ONLY,
+            ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+        ):
+            # Tools have no separate gRPC export — FULL_WITH_METADATA_SPANS
+            # behaves like METADATA_ONLY for tool spans. Drop every
+            # content-bearing seed field before the span attributes pass.
             seed.conversation_title = ""
+            seed.tool_description = ""
             include_content = False
         elif tool_mode == ContentCaptureMode.FULL:
             include_content = True
@@ -490,6 +522,7 @@ class Client:
             span=span,
             started_at=started_at,
             include_content=include_content,
+            _content_capture_mode=tool_mode,
         )
 
     def execute_tool_calls(
@@ -682,6 +715,198 @@ class Client:
 
         return _parse_submit_conversation_rating_response(parsed)
 
+    # ----------------------------------------------------------------- #
+    # Offline evaluation: experiments and scores
+    # ----------------------------------------------------------------- #
+
+    def create_experiment(self, request: CreateExperimentRequest) -> Experiment:
+        """Creates an experiment run via the Sigil eval control plane."""
+
+        self._assert_open()
+        return _experiments.create_experiment(
+            **self._eval_args(),
+            request=request,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def get_experiment(self, run_id: str) -> Experiment:
+        """Fetches a single experiment run by id."""
+
+        self._assert_open()
+        return _experiments.get_experiment(
+            **self._eval_args(),
+            run_id=run_id,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def update_experiment(self, run_id: str, request: UpdateExperimentRequest) -> Experiment:
+        """Patches an experiment run (name/description/tags/status/metadata/error/score_count)."""
+
+        self._assert_open()
+        return _experiments.update_experiment(
+            **self._eval_args(),
+            run_id=run_id,
+            request=request,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def complete_experiment(
+        self,
+        run_id: str,
+        status: ExperimentStatus | str,
+        *,
+        score_count: int | None = None,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Experiment:
+        """Finalizes an experiment run with a terminal ``status``.
+
+        Convenience wrapper over :meth:`update_experiment` for the common
+        finalize path (``succeeded``/``failed``/``canceled``).
+        """
+
+        return self.update_experiment(
+            run_id,
+            UpdateExperimentRequest(
+                status=status,
+                score_count=score_count,
+                error=error,
+                metadata=metadata,
+            ),
+        )
+
+    def cancel_experiment(self, run_id: str) -> Experiment:
+        """Cancels a running experiment (only transitions from ``running``)."""
+
+        self._assert_open()
+        return _experiments.cancel_experiment(
+            **self._eval_args(),
+            run_id=run_id,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def export_scores(self, scores: list[ScoreItem]) -> ExportScoresResponse:
+        """Publishes scores; set ``run_id`` on each score to attribute it to a run.
+
+        Call :meth:`flush` first so strict score ingest can find the
+        generations the scores reference. Scores are an ingest write (tenant
+        only), so they use the generation-export endpoint/auth, not the eval
+        control-plane target.
+        """
+
+        self._assert_open()
+        return _experiments.export_scores(
+            **self._score_args(),
+            scores=scores,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def list_experiment_scores(
+        self,
+        run_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Lists stored scores for a run. Returns ``(items, next_cursor)``."""
+
+        self._assert_open()
+        return _experiments.list_experiment_scores(
+            **self._eval_args(),
+            run_id=run_id,
+            limit=limit,
+            cursor=cursor,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def get_experiment_report(self, run_id: str) -> ExperimentReport:
+        """Fetches the aggregated report for a run."""
+
+        self._assert_open()
+        return _experiments.get_experiment_report(
+            **self._eval_args(),
+            run_id=run_id,
+            retry=self._experiment_retry_policy(),
+        )
+
+    def _eval_args(self) -> dict[str, Any]:
+        """Connection args for the protected eval control plane.
+
+        On Grafana Cloud the ``/api/v1/eval/*`` endpoints are reachable only
+        through the Grafana plugin resource proxy (which injects the trusted
+        actor identity), authenticated with a Grafana service-account token.
+        Configure that via env:
+
+        - ``SIGIL_EVAL_ENDPOINT``    base URL, e.g. ``https://<stack>.grafana.net``
+        - ``SIGIL_EVAL_PATH_PREFIX`` e.g. ``/api/plugins/grafana-sigil-app/resources``
+        - ``SIGIL_EVAL_AUTH_TOKEN``  service-account token (sent as ``Bearer``)
+
+        When unset, calls go directly to ``api.endpoint`` with ``/api/v1`` and the
+        generation-export auth headers (self-hosted / dev with tenant auth).
+        """
+
+        endpoint = (os.environ.get("SIGIL_EVAL_ENDPOINT") or "").strip() or self._config.api.endpoint
+        path_prefix = (os.environ.get("SIGIL_EVAL_PATH_PREFIX") or "").strip() or "/api/v1"
+        token = (os.environ.get("SIGIL_EVAL_AUTH_TOKEN") or "").strip()
+        if token != "":
+            value = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+            headers = {"Authorization": value}
+        else:
+            headers = dict(self._config.generation_export.headers)
+        return {
+            "api_endpoint": endpoint,
+            "insecure": bool(self._config.generation_export.insecure),
+            "headers": headers,
+            "path_prefix": path_prefix,
+        }
+
+    def _score_args(self) -> dict[str, Any]:
+        """Connection args for score export.
+
+        Scores are a tenant-only ingest write, published to the generation-export
+        endpoint/auth at ``/api/v1/scores:export`` — the same door as generation
+        ingest. This is intentionally independent of the eval control-plane
+        target (``SIGIL_EVAL_*``), which is only used for the protected
+        experiment lifecycle.
+        """
+
+        return {
+            "api_endpoint": self._config.api.endpoint,
+            "insecure": bool(self._config.generation_export.insecure),
+            "headers": self._config.generation_export.headers,
+            "scores_path": "/api/v1/scores:export",
+        }
+
+    def experiment_url(self, run_id: str) -> str:
+        """Returns a best-effort deep link to the experiment in the Sigil UI.
+
+        Override the link with the ``SIGIL_EXPERIMENT_URL_TEMPLATE`` env var,
+        which may contain ``{run_id}`` and ``{base}`` placeholders (``{base}``
+        resolves to the eval-endpoint origin). Without a template, the link is
+        derived from the eval-endpoint origin (``SIGIL_EVAL_ENDPOINT`` when set,
+        which on Grafana Cloud is your stack URL), falling back to the API
+        endpoint origin.
+        """
+
+        normalized = (run_id or "").strip()
+        template = os.environ.get("SIGIL_EXPERIMENT_URL_TEMPLATE", "").strip()
+        link_endpoint = (os.environ.get("SIGIL_EVAL_ENDPOINT") or "").strip() or self._config.api.endpoint
+        try:
+            base = _base_url_from_api_endpoint(link_endpoint, bool(self._config.generation_export.insecure))
+        except RatingTransportError:
+            base = ""
+        if template != "":
+            return template.replace("{run_id}", normalized).replace("{base}", base)
+        return f"{base}/a/grafana-sigil-app/evaluation/experiments/{urllib_parse.quote(normalized, safe='')}"
+
+    def _experiment_retry_policy(self) -> _experiments.RetryPolicy:
+        export = self._config.generation_export
+        return _experiments.RetryPolicy(
+            max_retries=max(export.max_retries, 0),
+            initial_backoff=max(export.initial_backoff.total_seconds(), 0.0),
+            max_backoff=max(export.max_backoff.total_seconds(), 0.0),
+        )
+
     def flush(self) -> None:
         """Flushes all queued generations immediately."""
 
@@ -762,7 +987,19 @@ class Client:
         if ctx_mode is not None:
             client_mode = _resolve_content_capture_mode(ctx_mode, client_mode)
         cc_mode = _resolve_content_capture_mode(seed.content_capture, client_mode)
-        span_title = "" if cc_mode == ContentCaptureMode.METADATA_ONLY else seed.conversation_title
+        # FULL_WITH_METADATA_SPANS keeps the proto export full but the OTel
+        # span must omit ``sigil.conversation.title``, so we zero the seed
+        # title for the start-span attribute pass (proto payload is unaffected
+        # — it is rebuilt from ``seed.conversation_title`` at end-time).
+        span_title = (
+            ""
+            if cc_mode
+            in (
+                ContentCaptureMode.METADATA_ONLY,
+                ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+            )
+            else seed.conversation_title
+        )
 
         span = self._tracer.start_span(
             _generation_span_name(seed.operation_name, seed.model.name),
@@ -1235,11 +1472,28 @@ class GenerationRecorder:
                         )
 
             self.span.update_name(_generation_span_name(generation.operation_name, generation.model.name))
-            _set_generation_span_attributes(self.span, generation)
+            # FULL_WITH_METADATA_SPANS: proto export keeps full content, but
+            # the span path must drop ``sigil.conversation.title``. Pass a
+            # shallow copy with the title zeroed only for the span emission
+            # so the in-memory ``generation`` (the proto payload) stays
+            # untouched.
+            span_generation = generation
+            if self._content_capture_mode == ContentCaptureMode.FULL_WITH_METADATA_SPANS:
+                span_generation = replace(generation, conversation_title="")
+            _set_generation_span_attributes(self.span, span_generation)
             if (
                 effective_content_capture_mode == ContentCaptureMode.METADATA_ONLY
-                and self._content_capture_mode != ContentCaptureMode.METADATA_ONLY
+                and self._content_capture_mode
+                not in (
+                    ContentCaptureMode.METADATA_ONLY,
+                    ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+                )
             ):
+                # Sanitizer fallback path overwrote the title at start time;
+                # explicitly clear the span attribute now. Skipped under
+                # FULL_WITH_METADATA_SPANS so the start-span omission isn't
+                # re-emitted as an empty value (the start span already left
+                # the attribute absent).
                 self.span.set_attribute(_span_attr_conversation_title, "")
 
             local_error: Exception | None = None
@@ -1258,9 +1512,16 @@ class GenerationRecorder:
                 except Exception as exc:  # noqa: BLE001
                     local_error = EnqueueError(f"sigil: generation enqueue failed: {exc}")
 
-            is_metadata_only = effective_content_capture_mode == ContentCaptureMode.METADATA_ONLY
+            # Redact span-side error text under both stripped modes. Proto
+            # export under FULL_WITH_METADATA_SPANS still gets the raw
+            # generation.call_error (set in normalize, untouched by
+            # _strip_content which only runs under METADATA_ONLY).
+            redact_span_errors = effective_content_capture_mode in (
+                ContentCaptureMode.METADATA_ONLY,
+                ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+            )
 
-            if not is_metadata_only:
+            if not redact_span_errors:
                 if call_error is not None:
                     self.span.record_exception(call_error)
                 if mapping_error is not None:
@@ -1276,21 +1537,25 @@ class GenerationRecorder:
                 error_category = _error_category_from_exception(call_error, fallback_sdk=True)
                 self.span.set_attribute(_span_attr_error_type, error_type)
                 self.span.set_attribute(_span_attr_error_category, error_category)
-                self.span.set_status(Status(StatusCode.ERROR, error_category if is_metadata_only else str(call_error)))
+                self.span.set_status(
+                    Status(StatusCode.ERROR, error_category if redact_span_errors else str(call_error))
+                )
             elif mapping_error is not None:
                 error_type = "mapping_error"
                 error_category = "sdk_error"
                 self.span.set_attribute(_span_attr_error_type, error_type)
                 self.span.set_attribute(_span_attr_error_category, error_category)
                 self.span.set_status(
-                    Status(StatusCode.ERROR, error_category if is_metadata_only else str(mapping_error))
+                    Status(StatusCode.ERROR, error_category if redact_span_errors else str(mapping_error))
                 )
             elif local_error is not None:
                 error_type = "validation_error" if isinstance(local_error, ValidationError) else "enqueue_error"
                 error_category = "sdk_error"
                 self.span.set_attribute(_span_attr_error_type, error_type)
                 self.span.set_attribute(_span_attr_error_category, error_category)
-                self.span.set_status(Status(StatusCode.ERROR, error_category if is_metadata_only else str(local_error)))
+                self.span.set_status(
+                    Status(StatusCode.ERROR, error_category if redact_span_errors else str(local_error))
+                )
             else:
                 self.span.set_status(Status(StatusCode.OK))
 
@@ -1430,6 +1695,7 @@ class EmbeddingRecorder:
     seed: EmbeddingStart
     span: Span
     started_at: datetime
+    _content_capture_mode: ContentCaptureMode = ContentCaptureMode.DEFAULT
 
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _ended: bool = False
@@ -1476,7 +1742,13 @@ class EmbeddingRecorder:
 
         completed_at = _to_utc(self.client._now())
         self.span.update_name(_embedding_span_name(self.seed.model.name))
-        _set_embedding_end_span_attributes(self.span, result, has_result, self.client._config.embedding_capture)
+        _set_embedding_end_span_attributes(
+            self.span,
+            result,
+            has_result,
+            self.client._config.embedding_capture,
+            self._content_capture_mode,
+        )
 
         local_error: Exception | None = None
         try:
@@ -1490,21 +1762,30 @@ class EmbeddingRecorder:
             except Exception as exc:  # noqa: BLE001
                 local_error = ValidationError(f"sigil: embedding validation failed: {exc}")
 
-        if call_error is not None:
-            self.span.record_exception(call_error)
-        if local_error is not None:
-            self.span.record_exception(local_error)
+        # Redact span-side error text under both stripped modes. Embeddings
+        # have no proto export, so the raw provider error never escapes the
+        # span path; matches the generation FULL_WITH_METADATA_SPANS contract.
+        redact_span_errors = self._content_capture_mode in (
+            ContentCaptureMode.METADATA_ONLY,
+            ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+        )
+
+        if not redact_span_errors:
+            if call_error is not None:
+                self.span.record_exception(call_error)
+            if local_error is not None:
+                self.span.record_exception(local_error)
 
         error_type = ""
         error_category = ""
         if call_error is not None:
             error_type = "provider_call_error"
             error_category = _error_category_from_exception(call_error, fallback_sdk=True)
-            self.span.set_status(Status(StatusCode.ERROR, str(call_error)))
+            self.span.set_status(Status(StatusCode.ERROR, error_category if redact_span_errors else str(call_error)))
         elif local_error is not None:
             error_type = "validation_error"
             error_category = "sdk_error"
-            self.span.set_status(Status(StatusCode.ERROR, str(local_error)))
+            self.span.set_status(Status(StatusCode.ERROR, error_category if redact_span_errors else str(local_error)))
         else:
             self.span.set_status(Status(StatusCode.OK))
 
@@ -1542,6 +1823,7 @@ class ToolExecutionRecorder:
     span: Span
     started_at: datetime
     include_content: bool
+    _content_capture_mode: ContentCaptureMode = ContentCaptureMode.DEFAULT
 
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _ended: bool = False
@@ -1616,12 +1898,19 @@ class ToolExecutionRecorder:
             final_error = content_error
 
         if final_error is not None:
-            self.span.record_exception(final_error)
-            self.span.set_attribute(_span_attr_error_type, "tool_execution_error")
-            self.span.set_attribute(
-                _span_attr_error_category, _error_category_from_exception(final_error, fallback_sdk=True)
+            # Tools have no proto export; under both stripped modes the span
+            # must not echo raw provider exception text via record_exception
+            # events or the status description.
+            redact_span_errors = self._content_capture_mode in (
+                ContentCaptureMode.METADATA_ONLY,
+                ContentCaptureMode.FULL_WITH_METADATA_SPANS,
             )
-            self.span.set_status(Status(StatusCode.ERROR, str(final_error)))
+            error_category = _error_category_from_exception(final_error, fallback_sdk=True)
+            if not redact_span_errors:
+                self.span.record_exception(final_error)
+            self.span.set_attribute(_span_attr_error_type, "tool_execution_error")
+            self.span.set_attribute(_span_attr_error_category, error_category)
+            self.span.set_status(Status(StatusCode.ERROR, error_category if redact_span_errors else str(final_error)))
         else:
             self.span.set_status(Status(StatusCode.OK))
 
@@ -1800,6 +2089,7 @@ def _set_embedding_end_span_attributes(
     result: EmbeddingResult,
     has_result: bool,
     capture_config,
+    mode: ContentCaptureMode = ContentCaptureMode.DEFAULT,
 ) -> None:
     if has_result:
         span.set_attribute(_span_attr_embedding_input_count, result.input_count)
@@ -1809,7 +2099,13 @@ def _set_embedding_end_span_attributes(
         span.set_attribute(_span_attr_response_model, result.response_model)
     if result.dimensions is not None:
         span.set_attribute(_span_attr_embedding_dim_count, result.dimensions)
-    if capture_config.capture_input and result.input_texts:
+    # Embeddings have no proto export; FULL_WITH_METADATA_SPANS matches
+    # METADATA_ONLY for input-text span attributes.
+    omit_input_texts = mode in (
+        ContentCaptureMode.METADATA_ONLY,
+        ContentCaptureMode.FULL_WITH_METADATA_SPANS,
+    )
+    if capture_config.capture_input and result.input_texts and not omit_input_texts:
         texts = _capture_embedding_input_texts(
             result.input_texts,
             capture_config.max_input_items,

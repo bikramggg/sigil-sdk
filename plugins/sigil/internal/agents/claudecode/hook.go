@@ -6,7 +6,6 @@ package claudecode
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,9 +18,11 @@ import (
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/claudecode/mapper"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/claudecode/state"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/claudecode/transcript"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/guard"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/envconfig"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/otel"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/redact"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/useragent"
 )
 
 // Version is overridden via -ldflags at build time. The dispatcher prints it
@@ -32,6 +33,20 @@ var Version = "dev"
 // AgentName is the Sigil identity attached to every generation this agent
 // emits. Stable across versions so dashboards survive renames.
 const AgentName = "claude-code"
+
+func exportConfig(endpoint, tenantID, authToken string) sigil.GenerationExportConfig {
+	return sigil.GenerationExportConfig{
+		Protocol: sigil.GenerationExportProtocolHTTP,
+		Endpoint: endpoint + "/api/v1/generations:export",
+		Headers:  map[string]string{"User-Agent": useragent.For("claude-code")},
+		Auth: sigil.AuthConfig{
+			Mode:          sigil.ExportAuthModeBasic,
+			BasicUser:     tenantID,
+			BasicPassword: authToken,
+			TenantID:      tenantID,
+		},
+	}
+}
 
 // otelInstrumentationName is the OTel instrumentation scope name attached
 // to every span and metric this agent emits. Renamed from "sigil-cc" when
@@ -49,17 +64,6 @@ type hookInput struct {
 	ToolUseID      string          `json:"tool_use_id,omitempty"`
 }
 
-type hookDecision struct {
-	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
-}
-
-type hookSpecificOutput struct {
-	HookEventName            string `json:"hookEventName"`
-	PermissionDecision       string `json:"permissionDecision,omitempty"`
-	PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
-	AdditionalContext        string `json:"additionalContext,omitempty"`
-}
-
 // Hook reads a single Claude Code hook payload from stdin, processes it, and
 // optionally writes a decision response to stdout. Returns an error only on
 // payload-shaped failures the dispatcher should log — runtime telemetry
@@ -72,9 +76,41 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	}
 	logger.Printf("event=%s session=%s transcript=%s", input.HookEventName, input.SessionID, input.TranscriptPath)
 
+	st := state.Load(input.SessionID)
+
+	// Route lightweight events that do not need real Sigil credentials first.
+	// SessionStart only updates local state; PreToolUse calls into the shared
+	// guard helper which manages its own credentials, timeouts, and
+	// fail-open/closed behaviour. Routing these before the missing-creds
+	// gate below means strict guard mode can still deny when SIGIL_* env
+	// vars are absent.
+	switch strings.TrimSpace(input.HookEventName) {
+	case "SessionStart":
+		st.Model = strings.TrimSpace(input.Model)
+		if err := state.Save(input.SessionID, st); err != nil {
+			logger.Printf("save state: %v", err)
+		}
+		return nil
+	case "PreToolUse":
+		guardCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		handlePreToolUse(guardCtx, stdout, input, st, logger)
+		return nil
+	case "", "Stop", "SessionEnd":
+		// Fall through to transcript export below.
+	default:
+		return nil
+	}
+
 	sigilEndpoint := os.Getenv("SIGIL_ENDPOINT")
 	tenantID := os.Getenv("SIGIL_AUTH_TENANT_ID")
 	authToken := os.Getenv("SIGIL_AUTH_TOKEN")
+
+	// A local-mode endpoint never needs real Cloud credentials. The
+	// launcher injects placeholders, but a user running the hook
+	// directly (e.g. for testing) might leave them empty — fill in
+	// stand-ins so the SDK proceeds.
+	tenantID, authToken = envconfig.LocalAuthPlaceholders(sigilEndpoint, tenantID, authToken)
 
 	missing := envconfig.MissingEnvVars(
 		[]string{"SIGIL_ENDPOINT", "SIGIL_AUTH_TENANT_ID", "SIGIL_AUTH_TOKEN"},
@@ -98,25 +134,7 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	defer cancel()
 	hookCtx = sigil.WithUserID(hookCtx, userID)
 
-	st := state.Load(input.SessionID)
-
-	switch strings.TrimSpace(input.HookEventName) {
-	case "", "Stop", "SessionEnd":
-		// Stop and SessionEnd hooks use the transcript to export generations.
-	case "SessionStart":
-		st.Model = strings.TrimSpace(input.Model)
-		if err := state.Save(input.SessionID, st); err != nil {
-			logger.Printf("save state: %v", err)
-		}
-		return nil
-	case "PreToolUse":
-		handlePreToolUse(hookCtx, stdout, input, st, sigilEndpoint, tenantID, authToken, logger)
-		return nil
-	default:
-		return nil
-	}
-
-	otelProviders, err := otel.Setup(hookCtx)
+	otelProviders, err := otel.Setup(hookCtx, input.SessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sigil claude-code: otel setup failed: %v\n", err)
 		logger.Printf("otel setup: %v", err)
@@ -137,6 +155,7 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 
 	lines, safeOffset := mapper.Coalesce(lines)
 	if safeOffset == 0 {
+		logger.Printf("no completed assistant turn yet; keeping offset=%d", st.Offset)
 		return nil
 	}
 	logger.Printf("coalesced to %d lines, safe offset=%d", len(lines), safeOffset)
@@ -159,16 +178,7 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	logger.Printf("produced %d generations", len(gens))
 
 	cfg := sigil.Config{
-		GenerationExport: sigil.GenerationExportConfig{
-			Protocol: sigil.GenerationExportProtocolHTTP,
-			Endpoint: sigilEndpoint + "/api/v1/generations:export",
-			Auth: sigil.AuthConfig{
-				Mode:          sigil.ExportAuthModeBasic,
-				BasicUser:     tenantID,
-				BasicPassword: authToken,
-				TenantID:      tenantID,
-			},
-		},
+		GenerationExport: exportConfig(sigilEndpoint, tenantID, authToken),
 	}
 
 	if otelProviders != nil {
@@ -230,107 +240,23 @@ func Hook(ctx context.Context, stdin io.Reader, stdout io.Writer, logger *log.Lo
 	return nil
 }
 
-func handlePreToolUse(
-	ctx context.Context,
-	stdout io.Writer,
-	input *hookInput,
-	st state.Session,
-	sigilEndpoint, tenantID, authToken string,
-	logger *log.Logger,
-) {
-	toolName := strings.TrimSpace(input.ToolName)
-	if toolName == "" {
-		return
-	}
-
-	modelName := strings.TrimSpace(st.Model)
-	if modelName == "" {
-		modelName = "unknown"
-	}
-
-	failOpen := true
-	cfg := sigil.Config{
-		API: sigil.APIConfig{
-			Endpoint: sigilEndpoint,
-		},
-		Hooks: sigil.HooksConfig{
-			Enabled:  true,
-			Phases:   []sigil.HookPhase{sigil.HookPhasePostflight},
-			Timeout:  1500 * time.Millisecond,
-			FailOpen: &failOpen,
-		},
-		GenerationExport: sigil.GenerationExportConfig{
-			Auth: sigil.AuthConfig{
-				Mode:          sigil.ExportAuthModeBasic,
-				BasicUser:     tenantID,
-				BasicPassword: authToken,
-				TenantID:      tenantID,
-			},
-		},
-	}
-
-	client := sigil.NewClient(cfg)
-	defer func() { _ = client.Shutdown(ctx) }()
-
-	req := sigil.HookEvaluateRequest{
-		Phase: sigil.HookPhasePostflight,
-		Context: sigil.HookContext{
-			AgentName:    AgentName,
-			AgentVersion: Version,
-			Model:        &sigil.HookModel{Provider: "anthropic", Name: modelName},
-		},
-		Input: sigil.HookInput{
-			Output: []sigil.Message{{
-				Role: sigil.RoleAssistant,
-				Parts: []sigil.Part{{
-					Kind: sigil.PartKindToolCall,
-					ToolCall: &sigil.ToolCall{
-						ID:        strings.TrimSpace(input.ToolUseID),
-						Name:      toolName,
-						InputJSON: input.ToolInput,
-					},
-				}},
-			}},
-		},
-	}
-	if payload, mErr := json.Marshal(req); mErr == nil {
-		logger.Printf("pre_tool_use hook request: %s", string(payload))
-	}
-
-	resp, err := client.EvaluateHook(ctx, req)
-	if err != nil {
-		logger.Printf("pre_tool_use hook eval: tool=%q endpoint=%q err=%v", toolName, sigilEndpoint, err)
-		return
-	}
-
-	if resp != nil {
-		logger.Printf(
-			"pre_tool_use hook eval: tool=%q endpoint=%q action=%q rule_id=%q reason=%q",
-			toolName,
-			sigilEndpoint,
-			string(resp.Action),
-			resp.RuleID,
-			resp.Reason,
-		)
-	}
-
-	if deniedErr := sigil.HookDeniedFromResponse(resp); deniedErr != nil {
-		reason := "tool call denied by Sigil guard"
-		var denied *sigil.HookDeniedError
-		if errors.As(deniedErr, &denied) && strings.TrimSpace(denied.Reason) != "" {
-			reason = denied.Reason
-		}
-		if strings.TrimSpace(reason) == "" {
-			reason = "tool call denied by Sigil guard"
-		}
-		out := hookDecision{
-			HookSpecificOutput: hookSpecificOutput{
-				HookEventName:            "PreToolUse",
-				PermissionDecision:       "deny",
-				PermissionDecisionReason: reason,
-			},
-		}
-		_ = json.NewEncoder(stdout).Encode(out)
+// handlePreToolUse evaluates the tool call against Sigil guards and writes a
+// PreToolUse deny envelope to stdout when the call is blocked. All Sigil
+// transport, credential, fail-open/closed, and local-endpoint placeholder
+// behaviour lives in the shared guard helper so this stays in lockstep with
+// the codex and copilot agents.
+func handlePreToolUse(ctx context.Context, stdout io.Writer, input *hookInput, st state.Session, logger *log.Logger) {
+	res := guard.EvaluateToolCall(ctx, envconfig.ResolveGuards(logger), guard.ToolCallInput{
+		AgentName:     AgentName,
+		AgentVersion:  Version,
+		ModelProvider: "anthropic",
+		ModelName:     strings.TrimSpace(st.Model),
+		ToolName:      strings.TrimSpace(input.ToolName),
+		ToolCallID:    strings.TrimSpace(input.ToolUseID),
+		ToolInputJSON: input.ToolInput,
+	}, logger)
+	if res.Blocked() {
+		guard.WriteHookSpecificOutputDeny(stdout, res.Reason)
 	}
 }
 

@@ -8,6 +8,12 @@ Sigil records normalized LLM generation and tool-execution telemetry using your 
 pnpm add @grafana/sigil-sdk-js
 ```
 
+For low-dependency runtimes that only need the core `SigilClient` and generation export APIs, use the slim core package:
+
+```bash
+pnpm add @grafana/sigil-sdk-js-core
+```
+
 For a Grafana Cloud setup walkthrough (where to find the endpoint URL, instance ID, and API token), refer to the [Grafana Cloud setup guide](https://grafana.com/docs/grafana-cloud/machine-learning/ai-observability/get-started/grafana-cloud/).
 
 ## Validation
@@ -58,6 +64,72 @@ await client.startGeneration(
 await client.shutdown();
 ```
 
+## Content Capture
+
+`contentCapture` controls what content the SDK includes in exported generation payloads and OTel span attributes. See [Content Capture Modes](../docs/concepts/content-capture-modes.md) for the canonical mode matrix and defaults; the snippets below show how to wire it up in TypeScript.
+
+Client-level default:
+
+```ts
+import { SigilClient } from "@grafana/sigil-sdk-js";
+
+const client = new SigilClient({
+  contentCapture: "metadata_only",
+});
+```
+
+The core SDK client treats `"default"` as `"no_tool_content"`: generation content is captured but tool-execution arguments and results stay out of spans.
+
+Per-generation override:
+
+```ts
+await client.startGeneration(
+  {
+    model: { provider: "openai", name: "gpt-5" },
+    contentCapture: "full",
+  },
+  async (recorder) => {
+    recorder.setResult({ output: [{ role: "assistant", content: "hi" }] });
+  }
+);
+```
+
+Per-tool-execution override (here `"full"` opts into capturing tool arguments and results in the span):
+
+```ts
+await client.startToolExecution(
+  { toolName: "search", contentCapture: "full" },
+  async (recorder) => {
+    recorder.setResult({ arguments: { q: "weather" }, result: { tempC: 18 } });
+  }
+);
+```
+
+Dynamic resolution via `contentCaptureResolver`:
+
+```ts
+const client = new SigilClient({
+  contentCaptureResolver: (metadata) => {
+    if (metadata?.["sigil.tenant"] === "healthcare") {
+      return "metadata_only";
+    }
+    return "default"; // defer to `contentCapture`
+  },
+});
+```
+
+The resolver receives the recording's metadata (or `undefined` for recording types that have no metadata, like tool executions). Thrown errors are caught and treated as `"metadata_only"` (fail-closed).
+
+Resolution precedence (highest to lowest):
+
+1. Per-recording `contentCapture` on `GenerationStart` / `ToolExecutionStart`
+2. `contentCaptureResolver` return value
+3. Client-level `contentCapture` (defaults to `"no_tool_content"`)
+
+Unlike the Go, Python, Java, and .NET SDKs, the JS SDK does not propagate the resolved capture mode through async context, so tool executions started inside a generation block do not automatically inherit the generation's mode. Set `contentCapture` on each `ToolExecutionStart` when you need a tool to follow a non-default policy.
+
+User-provided `metadata` and `tags` are not stripped by any capture mode. SDK-internal metadata keys that carry content (e.g. `call_error`, `sigil.conversation.title`) are stripped along with the matching content.
+
 ## Pre-Ingest Redaction
 
 Use `generationSanitizer` when you want to redact substrings from normalized generations before
@@ -71,7 +143,7 @@ import {
 
 const client = new SigilClient({
   generationSanitizer: createSecretRedactionSanitizer({
-    redactInputMessages: false,
+    redactInputMessages: false, // omit to fall back to SIGIL_REDACT_INPUT_MESSAGES, then false
     redactEmailAddresses: true,
   }),
 });
@@ -82,7 +154,7 @@ The built-in sanitizer:
 - redacts high-confidence secret formats in assistant text and thinking
 - redacts secret formats plus env-style secret values in tool call inputs and tool results
 - redacts email addresses by default
-- leaves user input unchanged unless `redactInputMessages: true` is set
+- leaves user input unchanged unless input redaction is enabled
 
 To preserve email addresses, opt out explicitly:
 
@@ -93,6 +165,65 @@ const client = new SigilClient({
   }),
 });
 ```
+
+### Configuring redaction via environment variables
+
+`createSecretRedactionSanitizer()` reads `SIGIL_REDACT_INPUT_MESSAGES` (accepts
+`1/0`, `true/false`, `yes/no`, `on/off`) when `redactInputMessages` is omitted.
+Precedence is explicit option > env var > `false`. An unrecognised env value is
+warned and falls back to the next layer, so a typo cannot silently flip
+redaction.
+
+```ts
+import {
+  createSecretRedactionSanitizer,
+  SigilClient,
+} from "@grafana/sigil-sdk-js";
+
+// Omit redactInputMessages so SIGIL_REDACT_INPUT_MESSAGES decides.
+const client = new SigilClient({
+  generationSanitizer: createSecretRedactionSanitizer(),
+});
+```
+
+## Hooks and Guards
+
+Use hooks when you want Sigil guard rules to run before an LLM call. The SDK evaluates the hook on your request path; guard rules configured in Grafana Cloud decide whether to allow, deny, or transform the input.
+
+Hooks are disabled by default. Enable them on the client and call `evaluateHook(...)` before the provider request:
+
+```ts
+import { HookDeniedError, SigilClient } from "@grafana/sigil-sdk-js";
+
+const client = new SigilClient({
+  hooks: { enabled: true, phases: ["preflight"], timeoutMs: 15_000, failOpen: true },
+});
+
+let messages = [{ role: "user" as const, content: "Summarize this customer note..." }];
+const response = await client.evaluateHook({
+  phase: "preflight",
+  context: {
+    agentName: "support-agent",
+    agentVersion: "1.0.0",
+    model: { provider: "openai", name: "gpt-5" },
+  },
+  input: {
+    messages,
+    systemPrompt: "You are a helpful support agent.",
+    conversationPreview: "Summarize this customer note...",
+  },
+});
+
+if (response.action === "deny") {
+  throw new HookDeniedError(response.reason ?? "", response.ruleId, response.evaluations);
+}
+
+messages = response.transformedInput?.messages ?? messages;
+```
+
+With `failOpen: true`, hook transport errors resolve to allow so an unavailable evaluator does not block production traffic. Set `failOpen: false` for strict paths that should fail closed.
+
+If you use transformed input, pass the transformed messages/system prompt to the provider and record those same values in `startGeneration(...)`. If you use the Vercel AI SDK adapter, see `docs/frameworks/vercel-ai-sdk.md` for automatic preflight hook wiring.
 
 Configure OTEL exporters (traces/metrics) in your application OTEL SDK setup. You can optionally pass `tracer` and `meter` directly to `SigilClient`.
 
@@ -368,12 +499,12 @@ auth: {
 },
 ```
 
-## Env-secret wiring example
+## Wiring custom env vars
 
-The SDK does not auto-load env vars. Resolve env secrets in your app and map them into config.
+The SDK only auto-loads `SIGIL_*` env vars (`SIGIL_ENDPOINT`, `SIGIL_PROTOCOL`, `SIGIL_AUTH_MODE`, `SIGIL_AUTH_TOKEN`, etc.) when you call `new SigilClient()`. For any other env var (for example one your secret manager exposes under a different name), read it in your app and pass the value into the config:
 
 ```ts
-const generationBearerToken = (process.env.SIGIL_GEN_BEARER_TOKEN ?? "").trim();
+const generationBearerToken = (process.env.MY_APP_SIGIL_TOKEN ?? "").trim();
 
 const client = new SigilClient({
   generationExport: {

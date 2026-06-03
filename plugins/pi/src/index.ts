@@ -1,7 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   ContentCaptureMode,
   Message,
@@ -11,50 +8,30 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSigilClient } from "./client.js";
 import type { SigilPiConfig } from "./config.js";
 import { loadConfig } from "./config.js";
+import { detectPiVersion } from "./detectPiVersion.js";
 import { resolveGitBranch } from "./git.js";
 import { runToolCallGuard } from "./guard.js";
+import { resolvePiGenerationLineage } from "./lineage.js";
+import { logger } from "./logger.js";
 import {
+  type CachedRequestControls,
+  extractRequestControls,
   mapGenerationResult,
   mapGenerationStart,
-  mapToolNames,
+  mapTools,
   mapUserMessage,
   type PiAssistantMessage,
+  type PiToolInfo,
   type PiToolResult,
   type PiUserMessage,
+  resolveConversationTitle,
   type ToolTiming,
+  userMessageText,
 } from "./mappers.js";
 import {
   createTelemetryProviders,
   type TelemetryProviders,
 } from "./telemetry.js";
-
-function detectPiVersion(): string | undefined {
-  try {
-    // Resolve an exported subpath via ESM resolution, then walk up to package.json.
-    // createRequire won't work here: pi's package.json uses "import"-only exports.
-    const resolved = import.meta.resolve("@mariozechner/pi-coding-agent/hooks");
-    // import.meta.resolve is sync on Node ≥20.6; older versions return a
-    // Promise. Bail out in that case rather than passing a Promise downstream.
-    if (typeof resolved !== "string") return undefined;
-    let dir = dirname(fileURLToPath(resolved));
-    for (let i = 0; i < 5; i++) {
-      try {
-        const pkgPath = join(dir, "package.json");
-        const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as {
-          name?: string;
-          version?: string;
-        };
-        if (pkg.name === "@mariozechner/pi-coding-agent") return pkg.version;
-      } catch {
-        // no package.json at this level, keep walking
-      }
-      dir = dirname(dir);
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 export default function (pi: ExtensionAPI) {
   let sigil: SigilClient | null = null;
@@ -76,10 +53,15 @@ export default function (pi: ExtensionAPI) {
   // same turn, so this is the actual completion time of the model call.
   // 0 means: no assistant message_end seen yet for this turn.
   let assistantMessageEndTime = 0;
-
-  function debugLog(msg: string, ...args: unknown[]) {
-    if (config?.debug) console.error(`[sigil-pi] ${msg}`, ...args);
-  }
+  // Cached from the most recent `before_agent_start`. Outlives a single
+  // turn so multi-turn tool loops reuse the same prompt; cleared on
+  // agent_end and session_shutdown.
+  let currentSystemPrompt: string | undefined;
+  // Refreshed for every `before_provider_request` and consumed by the
+  // matching `turn_end`. Cleared in the per-turn finally so a stale value
+  // from turn N never leaks into turn N+1, and also on `agent_end` /
+  // session shutdown in case a turn ends without a matching `turn_end`.
+  let currentRequestControls: CachedRequestControls = {};
 
   // Tool execution timing: toolCallId → start timestamp
   const toolStarts = new Map<string, { toolName: string; startedAt: number }>();
@@ -92,6 +74,12 @@ export default function (pi: ExtensionAPI) {
   // must NOT be cleared at turn_start — only after consume and on session
   // boundaries.
   const pendingInputMessages: Message[] = [];
+
+  // First user prompt text seen in this session, used to derive a
+  // conversation title when pi has no user-set session name. First prompt
+  // wins, so it persists across turns and is only cleared on session
+  // boundaries (never in resetTurnState).
+  let firstUserText: string | undefined;
 
   function resetTurnState() {
     turnStartTime = 0;
@@ -107,13 +95,16 @@ export default function (pi: ExtensionAPI) {
       try {
         await telemetry.shutdown();
       } catch (err) {
-        console.warn("[sigil-pi] telemetry shutdown failed:", err);
+        logger.error("telemetry shutdown failed", err);
       }
       telemetry = null;
     }
     resetTurnState();
     pendingInputMessages.length = 0;
+    firstUserText = undefined;
     lastSeenModel = null;
+    currentSystemPrompt = undefined;
+    currentRequestControls = {};
   }
 
   function cacheAssistantModel(message: PiAssistantMessage) {
@@ -129,7 +120,7 @@ export default function (pi: ExtensionAPI) {
         try {
           await sigil.shutdown();
         } catch (err) {
-          console.warn("[sigil-pi] stale client shutdown failed:", err);
+          logger.error("stale client shutdown failed", err);
         }
       }
 
@@ -156,7 +147,7 @@ export default function (pi: ExtensionAPI) {
           const instanceId = ctx.sessionManager.getSessionId() || randomUUID();
           telemetry = createTelemetryProviders(config.otlp, instanceId);
         } catch (err) {
-          console.warn("[sigil-pi] failed to create OTel providers:", err);
+          logger.error("failed to create OTel providers", err);
         }
       }
 
@@ -169,9 +160,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      debugLog(`enabled, endpoint=${config.endpoint} auth=${config.auth.mode}`);
+      logger.debug(
+        `enabled, endpoint=${config.endpoint} auth=${config.auth.mode}`,
+      );
     } catch (err) {
-      console.warn("[sigil-pi] session_start failed:", err);
+      logger.error("session_start failed", err);
       sigil = null;
       await resetSessionState();
     }
@@ -181,6 +174,45 @@ export default function (pi: ExtensionAPI) {
     resetTurnState();
     if (!sigil) return;
     turnStartTime = Date.now();
+  });
+
+  pi.on("before_agent_start", async (event, _ctx) => {
+    if (!sigil || !config) return;
+    try {
+      // System prompts encode project conventions (CLAUDE.md, skill text,
+      // etc.). Gate on contentCapture the same way `git.branch` is gated.
+      if (config.contentCapture === "metadata_only") return;
+      const prompt = (event as { systemPrompt?: unknown }).systemPrompt;
+      if (typeof prompt === "string" && prompt.length > 0) {
+        currentSystemPrompt = prompt;
+      }
+    } catch (err) {
+      logger.error("before_agent_start failed", err);
+    }
+  });
+
+  pi.on("agent_end", async (_event, _ctx) => {
+    // Clear both caches at the agent boundary. `currentRequestControls` is
+    // normally cleared in turn_end's finally, but if an agent loop ends
+    // without a matching turn_end, those provider settings could otherwise
+    // attach to the next agent loop's first exported generation.
+    currentSystemPrompt = undefined;
+    currentRequestControls = {};
+  });
+
+  // Refresh request controls before every provider call. The payload is
+  // provider-specific (Anthropic/OpenAI/Gemini), so extraction is purely
+  // structural — see `extractRequestControls`. This handler MUST NOT return
+  // a value: pi treats a returned value as a payload replacement.
+  pi.on("before_provider_request", async (event, _ctx) => {
+    if (!sigil) return;
+    try {
+      const payload = (event as { payload?: unknown }).payload;
+      currentRequestControls = extractRequestControls(payload);
+    } catch (err) {
+      logger.error("before_provider_request failed", err);
+      currentRequestControls = {};
+    }
   });
 
   pi.on("message_end", async (event, _ctx) => {
@@ -201,10 +233,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (!isUserMessage(message)) return;
+      if (firstUserText === undefined) {
+        const text = userMessageText(message).trim();
+        if (text.length > 0) firstUserText = text;
+      }
       const mapped = mapUserMessage(message, config.contentCapture);
       if (mapped) pendingInputMessages.push(mapped);
     } catch (err) {
-      console.warn("[sigil-pi] message_end failed:", err);
+      logger.error("message_end failed", err);
     }
   });
 
@@ -232,7 +268,7 @@ export default function (pi: ExtensionAPI) {
       toolName: event.toolName,
       input: event.input as Record<string, unknown>,
       failOpen: config.guards.failOpen,
-      logger: { warn: (msg: string) => console.warn(msg) },
+      logger: { warn: (msg: string) => logger.warn(msg) },
     });
   });
 
@@ -245,7 +281,7 @@ export default function (pi: ExtensionAPI) {
         startedAt: Date.now(),
       });
     } catch (err) {
-      console.warn("[sigil-pi] tool_execution_start failed:", err);
+      logger.error("tool_execution_start failed", err);
     }
   });
 
@@ -265,7 +301,7 @@ export default function (pi: ExtensionAPI) {
         isError: event.isError,
       });
     } catch (err) {
-      console.warn("[sigil-pi] tool_execution_end failed:", err);
+      logger.error("tool_execution_end failed", err);
     }
   });
 
@@ -274,15 +310,53 @@ export default function (pi: ExtensionAPI) {
 
     try {
       if (!isAssistantMessage(event.message)) {
-        console.warn(
-          "[sigil-pi] turn_end: assistant message shape did not validate, skipping",
+        logger.warn(
+          "turn_end: assistant message shape did not validate, skipping",
         );
         return;
       }
 
       const msg = event.message;
       const contentCapture = config.contentCapture;
-      const toolDefs = mapToolNames(turnToolTimings);
+
+      // Build the active tool catalog from pi's registry. Prefer the active
+      // set (what the model was offered this turn) so evaluators can
+      // compute precision/recall. `null` means the active-set API is
+      // unavailable (older pi versions); an empty Set means it returned
+      // explicitly no tools — those are different cases and `mapTools`
+      // treats them differently.
+      let toolCatalog: PiToolInfo[] = [];
+      try {
+        toolCatalog = pi.getAllTools?.() ?? [];
+      } catch (err) {
+        logger.debug("getAllTools failed", err);
+        toolCatalog = [];
+      }
+      let activeNames: Set<string> | null = null;
+      try {
+        const active = pi.getActiveTools?.();
+        if (Array.isArray(active)) activeNames = new Set(active);
+      } catch (err) {
+        logger.debug("getActiveTools failed", err);
+      }
+      if (
+        toolCatalog.length === 0 &&
+        activeNames !== null &&
+        activeNames.size > 0
+      ) {
+        // getAllTools threw or returned [] but getActiveTools still gave us
+        // names — synthesize name-only defs so the seed records the tools
+        // pi actually offered the model. Without this, `mapTools` would
+        // filter an empty catalog and drop the tool list entirely.
+        toolCatalog = Array.from(activeNames).map((name) => ({ name }));
+      } else if (activeNames === null && toolCatalog.length === 0) {
+        // Neither catalog nor active-set API — fall back to the called-tools
+        // subset so older pi versions still emit something useful.
+        const calledNames = new Set(turnToolTimings.map((t) => t.toolName));
+        toolCatalog = Array.from(calledNames).map((name) => ({ name }));
+        activeNames = calledNames;
+      }
+      const toolDefs = mapTools(toolCatalog, activeNames, contentCapture);
 
       // Read the current sessionId every turn. SessionManager reassigns
       // sessionId on fork/branch, and extensions that spawn child sessions
@@ -316,15 +390,47 @@ export default function (pi: ExtensionAPI) {
           : undefined;
       const builtinTags = gitBranch ? { "git.branch": gitBranch } : undefined;
 
-      const seed = mapGenerationStart(
+      // Resolve lineage at `turn_end`, not `message_end`: pi awaits
+      // extension `message_end` callbacks *before* calling
+      // `sessionManager.appendMessage` (see agent-session.js `_publish`),
+      // so the assistant entry is not yet in the tree at that point. By
+      // `turn_end` it has been appended and any subsequent extension
+      // mutations have settled.
+      const lineage = resolvePiGenerationLineage(
+        ctx.sessionManager,
         msg,
         conversationId,
-        config.agentName,
-        config.agentVersion,
-        startedAtMs,
-        toolDefs.length > 0 ? toolDefs : undefined,
-        builtinTags,
       );
+
+      // Prefer pi's user-set session name; otherwise derive from the first
+      // prompt (suppressed in metadata_only). Resolved per turn so a name
+      // set mid-session shows up on the next generation.
+      let sessionName: string | undefined;
+      try {
+        sessionName = ctx.sessionManager.getSessionName?.();
+      } catch (err) {
+        logger.debug("getSessionName failed", err);
+      }
+      const conversationTitle = resolveConversationTitle({
+        sessionName,
+        firstUserText,
+        conversationId,
+        contentCapture,
+      });
+
+      const seed = mapGenerationStart(msg, {
+        conversationId,
+        conversationTitle,
+        agentName: config.agentName,
+        agentVersion: config.agentVersion,
+        startedAt: startedAtMs,
+        tools: toolDefs.length > 0 ? toolDefs : undefined,
+        tags: builtinTags,
+        systemPrompt: currentSystemPrompt,
+        requestControls: currentRequestControls,
+        generationId: lineage.generationId,
+        parentGenerationIds: lineage.parentGenerationIds,
+      });
 
       const toolResults = (event.toolResults ?? []) as PiToolResult[];
       // Snapshot the buffer; the finally below clears it in place and
@@ -359,29 +465,31 @@ export default function (pi: ExtensionAPI) {
             turnToolTimings,
             {
               conversationId,
+              conversationTitle,
               agentName: (config as SigilPiConfig).agentName,
               agentVersion: (config as SigilPiConfig).agentVersion,
               contentCapture,
             },
           );
         });
-        debugLog(
+        logger.debug(
           `generation queued, model=${msg.model} tokens=${msg.usage.totalTokens}`,
         );
       } catch (err) {
-        debugLog("generation export failed", err);
+        logger.debug("generation export failed", err);
       }
       if (telemetry) {
         void telemetry.forceFlush().catch((err) => {
-          debugLog("telemetry flush failed", err);
+          logger.debug("telemetry flush failed", err);
         });
       }
     } catch (err) {
-      console.warn("[sigil-pi] turn_end failed:", err);
+      logger.error("turn_end failed", err);
     } finally {
       toolStarts.clear();
       turnToolTimings.length = 0;
       pendingInputMessages.length = 0;
+      currentRequestControls = {};
     }
   });
 
@@ -390,7 +498,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await sigil.shutdown();
       } catch (err) {
-        console.warn("[sigil-pi] session shutdown failed:", err);
+        logger.error("session shutdown failed", err);
       }
     }
 
@@ -408,6 +516,7 @@ export function emitToolSpans(
   timings: ToolTiming[],
   opts: {
     conversationId?: string;
+    conversationTitle?: string;
     agentName: string;
     agentVersion?: string;
     contentCapture: ContentCaptureMode;
@@ -444,6 +553,7 @@ export function emitToolSpans(
         toolCallId: timing.toolCallId,
         toolType: "function",
         conversationId: opts.conversationId,
+        conversationTitle: opts.conversationTitle,
         agentName: opts.agentName,
         agentVersion: opts.agentVersion,
         requestModel: msg.model,
@@ -478,10 +588,7 @@ export function emitToolSpans(
       toolRec.setResult(end);
       toolRec.end();
     } catch (err) {
-      console.warn(
-        `[sigil-pi] failed to emit tool span for ${timing.toolName}:`,
-        err,
-      );
+      logger.error(`failed to emit tool span for ${timing.toolName}`, err);
     }
   }
 }

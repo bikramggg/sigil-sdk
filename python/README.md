@@ -135,29 +135,18 @@ Full framework examples:
 
 ## Quick Start (Sync Generation)
 
-The snippet below configures the SDK explicitly. As an alternative, set `SIGIL_*` environment variables and call `Client()` with no arguments — refer to the [Grafana Cloud setup guide](https://grafana.com/docs/grafana-cloud/machine-learning/ai-observability/get-started/grafana-cloud/) for the variable names.
+`Client()` reads `SIGIL_*` env vars by default. See the [Grafana Cloud setup guide](https://grafana.com/docs/grafana-cloud/machine-learning/ai-observability/get-started/grafana-cloud/) for the variable names. Pass an explicit `ClientConfig` only when you need to override.
 
 ```python
 from sigil_sdk import (
-    AuthConfig,
     Client,
-    ClientConfig,
-    GenerationExportConfig,
     GenerationStart,
     ModelRef,
     assistant_text_message,
     user_text_message,
 )
 
-client = Client(
-    ClientConfig(
-        generation_export=GenerationExportConfig(
-            protocol="http",
-            endpoint="http://localhost:8080",
-            auth=AuthConfig(mode="tenant", tenant_id="dev-tenant"),
-        ),
-    )
-)
+client = Client()  # reads SIGIL_* env vars
 
 with client.start_generation(
     GenerationStart(
@@ -180,6 +169,22 @@ with client.start_generation(
 client.shutdown()
 ```
 
+Explicit configuration form:
+
+```python
+from sigil_sdk import AuthConfig, Client, ClientConfig, GenerationExportConfig
+
+client = Client(
+    ClientConfig(
+        generation_export=GenerationExportConfig(
+            protocol="http",
+            endpoint="http://localhost:8080",
+            auth=AuthConfig(mode="tenant", tenant_id="dev-tenant"),
+        ),
+    )
+)
+```
+
 ## Pre-Ingest Redaction
 
 Use `generation_sanitizer` when you want to redact substrings from normalized generations before
@@ -197,7 +202,7 @@ client = Client(
     ClientConfig(
         generation_sanitizer=create_secret_redaction_sanitizer(
             SecretRedactionOptions(
-                redact_input_messages=False,
+                redact_input_messages=False,  # None falls back to SIGIL_REDACT_INPUT_MESSAGES, then False
                 redact_email_addresses=True,
             )
         )
@@ -210,7 +215,7 @@ The built-in sanitizer:
 - redacts high-confidence secret formats in assistant text and thinking
 - redacts secret formats plus env-style secret values in tool call inputs and tool results
 - redacts email addresses by default
-- leaves user input unchanged unless `redact_input_messages=True` is set
+- leaves user input unchanged unless input redaction is enabled
 
 To preserve email addresses, opt out explicitly:
 
@@ -223,6 +228,80 @@ client = Client(
     )
 )
 ```
+
+### Configuring redaction via environment variables
+
+`create_secret_redaction_sanitizer()` reads `SIGIL_REDACT_INPUT_MESSAGES` (accepts `1/0`, `true/false`, `yes/no`, `on/off`) when `redact_input_messages` is left `None`. Precedence is explicit option > env var > `False`. An unrecognised env value logs a warning through the `sigil_sdk` logger and falls back to the next layer, so a typo cannot silently flip redaction.
+
+```python
+from sigil_sdk import (
+    Client,
+    ClientConfig,
+    create_secret_redaction_sanitizer,
+)
+
+# Leave redact_input_messages unset so SIGIL_REDACT_INPUT_MESSAGES decides.
+client = Client(
+    ClientConfig(
+        generation_sanitizer=create_secret_redaction_sanitizer(),
+    )
+)
+```
+
+## Hooks and Guards
+
+Use hooks when you want Sigil guard rules to run before an LLM call. The SDK evaluates the hook on your request path; guard rules configured in Grafana Cloud decide whether to allow, deny, or transform the input.
+
+Hooks are disabled by default. Enable them on the client and call `evaluate_hook(...)` before the provider request:
+
+```python
+from sigil_sdk import (
+    Client,
+    ClientConfig,
+    HookContext,
+    HookEvaluateRequest,
+    HookInput,
+    HookModel,
+    HookPhase,
+    HooksConfig,
+    Message,
+    MessageRole,
+    hook_denied_from_response,
+    text_part,
+)
+
+client = Client(ClientConfig(hooks=HooksConfig(enabled=True)))
+
+messages = [
+    Message(role=MessageRole.USER, parts=[text_part("Summarize this customer note...")]),
+]
+response = client.evaluate_hook(
+    HookEvaluateRequest(
+        phase=HookPhase.PREFLIGHT.value,
+        context=HookContext(
+            agent_name="support-agent",
+            agent_version="1.0.0",
+            model=HookModel(provider="openai", name="gpt-5"),
+        ),
+        input=HookInput(
+            messages=messages,
+            system_prompt="You are a helpful support agent.",
+            conversation_preview="Summarize this customer note...",
+        ),
+    )
+)
+
+denied = hook_denied_from_response(response)
+if denied is not None:
+    raise denied
+
+if response.transformed_input is not None:
+    messages = response.transformed_input.messages or messages
+```
+
+`HooksConfig` defaults to `phases=["preflight"]`, `timeout_seconds=15.0`, and `fail_open=True`. With fail-open enabled, hook transport errors resolve to allow so an unavailable evaluator does not block production traffic. Set `fail_open=False` for strict paths that should fail closed.
+
+If you use transformed input, pass the transformed messages/system prompt to the provider and record those same values in `start_generation(...)`. For a runnable example, see `../examples/getting-started/python-hooks/`.
 
 Configure OTEL exporters (traces/metrics) in your application OTEL SDK setup. You can optionally pass `tracer` and `meter` via `ClientConfig`.
 
@@ -341,17 +420,20 @@ with with_conversation_id("conv-ctx"), with_agent_name("planner"), with_agent_ve
 
 ## Content Capture Mode
 
-`ContentCaptureMode` controls what content is included in exported generation payloads and OTel span attributes. Use it to prevent sensitive text (prompts, tool I/O, model responses) from leaving the process.
+`ContentCaptureMode` controls what content is included in exported generation payloads and OTel span attributes. Use it to prevent sensitive text (prompts, tool I/O, model responses) from leaving the process. See [Content Capture Modes](../docs/concepts/content-capture-modes.md) for the cross-SDK reference, including the per-surface behavior matrix.
 
+| Mode                            | Generation export                            | Generation span             | Tool spans                              | Embedding span                          |
+| ------------------------------- | -------------------------------------------- | --------------------------- | --------------------------------------- | --------------------------------------- |
+| `FULL`                          | Full content                                 | Content attributes included | Arguments and results included          | Input texts included when capture is on |
+| `NO_TOOL_CONTENT` (SDK default) | Full content                                 | Content attributes included | Arguments and results excluded          | Input texts included when capture is on |
+| `METADATA_ONLY`                 | Structure only; text and tool I/O stripped   | Content attributes omitted  | Arguments and results excluded          | Input texts omitted                     |
+| `FULL_WITH_METADATA_SPANS`      | Full content                                 | Content attributes omitted  | Arguments and results excluded          | Input texts omitted                     |
 
-| Mode                            | Generations                            | Tool spans                               |
-| ------------------------------- | -------------------------------------- | ---------------------------------------- |
-| `FULL`                          | All content exported                   | Arguments and results in span attributes |
-| `NO_TOOL_CONTENT` (SDK default) | All content exported                   | Arguments and results excluded           |
-| `METADATA_ONLY`                 | Structure preserved, all text stripped | Arguments and results excluded           |
+`DEFAULT` is a placeholder for "inherit from the next layer"; at the client level it resolves to `NO_TOOL_CONTENT`. The SDK default is `NO_TOOL_CONTENT`, which matches the SDK's behavior before this feature was added.
 
+`FULL_WITH_METADATA_SPANS` is the right mode when the gRPC ingest destination is private but the OTel trace/metric destination is shared and must not receive any content. Tool execution and embedding spans behave like `METADATA_ONLY` under this mode because they have no separate gRPC export.
 
-The default is `NO_TOOL_CONTENT`, which matches the SDK's behavior before this feature was added.
+User-provided `metadata` and `tags` are **not** stripped by any capture mode; callers must avoid putting sensitive content in those dicts when using `METADATA_ONLY` or `FULL_WITH_METADATA_SPANS`. SDK-internal metadata keys that carry content (e.g. `call_error`, `sigil.conversation.title`) are stripped along with the matching content.
 
 ### Client-level default
 
@@ -411,12 +493,21 @@ client = Client(ClientConfig(
 ))
 ```
 
-### Resolution precedence (highest to lowest)
+### Resolution precedence
 
-1. Per-recording `content_capture` field (`GenerationStart` / `ToolExecutionStart`)
-2. `content_capture_resolver` return value
-3. `ContextVar` from `with_content_capture_mode()`
-4. `ClientConfig.content_capture` (defaults to `NO_TOOL_CONTENT`)
+For generations, highest to lowest:
+
+1. `GenerationStart.content_capture`
+2. `with_content_capture_mode(...)` when set
+3. `content_capture_resolver` return value
+4. `ClientConfig.content_capture` (defaults to `NO_TOOL_CONTENT`; `DEFAULT` at the client level resolves to `NO_TOOL_CONTENT`)
+
+For tool executions, highest to lowest:
+
+1. `ToolExecutionStart.content_capture`
+2. Parent generation's resolved mode, or `with_content_capture_mode(...)` when set
+3. `content_capture_resolver` return value
+4. `ClientConfig.content_capture` (defaults to `NO_TOOL_CONTENT`; `DEFAULT` at the client level resolves to `NO_TOOL_CONTENT`)
 
 Exceptions in the resolver are caught and treated as `METADATA_ONLY` (fail-closed).
 
@@ -509,9 +600,9 @@ auth=AuthConfig(
 )
 ```
 
-## Env-secret wiring example
+## Wiring custom env vars
 
-The SDK does not auto-load env vars. Resolve env values in your application and pass them into config explicitly.
+The SDK only auto-loads `SIGIL_*` env vars (`SIGIL_ENDPOINT`, `SIGIL_PROTOCOL`, `SIGIL_AUTH_MODE`, `SIGIL_AUTH_TOKEN`, etc.) when you call `Client()`. For any other env var (for example one your secret manager exposes under a different name), read it in your app and pass the value into the config:
 
 ```python
 import os
@@ -519,7 +610,7 @@ from sigil_sdk import AuthConfig, ClientConfig
 
 cfg = ClientConfig()
 
-gen_token = (os.getenv("SIGIL_GEN_BEARER_TOKEN") or "").strip()
+gen_token = (os.getenv("MY_APP_SIGIL_TOKEN") or "").strip()
 if gen_token:
     cfg.generation_export.auth = AuthConfig(mode="bearer", bearer_token=gen_token)
 ```
@@ -587,6 +678,63 @@ The SDK emits these OTel histograms through your configured OTEL meter provider:
 - `gen_ai.client.time_to_first_token`
 - `gen_ai.client.tool_calls_per_operation`
 
+## Experiments (offline evaluation)
+
+Run any agent over a dataset as a Sigil **experiment**, grade locally, and
+publish scores you can compare in the Sigil UI — no framework adapter required.
+The runner rides on the core generation recording above: record the agent's call
+through `run.start_generation(...)` and every generation is auto-tagged with the
+experiment `run_id` and captured for scoring.
+
+```python
+from sigil_sdk import (
+    DatasetItem, ExperimentRunner, Generation, GenerationStart, ModelRef,
+    ScoreOutput, ScoreValue, TargetResult, assistant_text_message, user_text_message,
+)
+
+dataset = [
+    DatasetItem(id="capital-fr", input="Capital of France?", expected="Paris",
+                metadata={"task_id": "capital", "task_category": "trivia"}),
+]
+
+def target(item, run):
+    # Record the agent's call so the generation carries the experiment run_id.
+    with run.start_generation(GenerationStart(model=ModelRef(provider="openai", name="gpt-4o-mini"))) as rec:
+        answer = my_agent(item.input)  # your code
+        rec.set_result(Generation(
+            model=ModelRef(provider="openai", name="gpt-4o-mini"),
+            input=[user_text_message(str(item.input))],
+            output=[assistant_text_message(answer)],
+        ))
+    return TargetResult(output=answer)  # generation ids captured automatically
+
+def exact_match(item, result):
+    passed = str(item.expected).lower() in str(result.output).lower()
+    return [ScoreOutput(evaluator_id="suite.exact_match", evaluator_version="2026-05-30",
+                        score_key="exact_match", value=ScoreValue(number=1.0 if passed else 0.0),
+                        passed=passed)]
+
+runner = ExperimentRunner(client=client, run_id="pr-123", name="PR 123",
+                          dataset={"id": "smoke", "version": "2026-05-30"}, tags=["ci"])
+result = runner.run(dataset, target, [exact_match])
+print(result.url)  # deep link to the experiment in Sigil
+```
+
+The runner creates the run (`source="external"`), runs + grades each item,
+exports scores attributed to the `run_id`, and finalizes the run (`succeeded` on
+clean exit, `failed` on exception, `canceled` on Ctrl-C). For ad-hoc loops use
+the lower-level `experiment(...)` context manager. A/B testing is two runs with
+different `run_id`/`tags`. Upload modes: `continuous` (default, publish per
+item), `bulk` (publish at the end), `manual` (publish + finalize only when you
+call `run.publish()` / `run.finalize()`).
+
+If you use a supported framework, prefer its adapter (e.g. `sigil-sdk-langgraph`)
+— it auto-captures generation ids from the framework callback so you don't wrap
+`start_generation` yourself. See the `sigil-experiments` skill
+(`python/skills/sigil-experiments/SKILL.md`) and the runnable example at
+`examples/python-experiment/` for grading patterns (including LLM-as-judge) and
+uploading older runs.
+
 ## Public API Overview
 
 Core client and lifecycle:
@@ -614,6 +762,13 @@ Helpers:
 Validation:
 
 - `validate_generation(...)`
+
+Experiments (offline evaluation):
+
+- `experiment(...)`, `ExperimentRunner`, `ExperimentRun`
+- `DatasetItem`, `TargetResult`, `ScoreOutput`, `ExperimentResult`
+- `stable_id(...)`
+- `Client.create_experiment(...)`, `Client.export_scores(...)`, `Client.complete_experiment(...)`, `Client.experiment_url(...)`
 
 ## Provider Helper Packages
 

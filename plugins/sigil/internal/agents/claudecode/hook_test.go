@@ -6,14 +6,18 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/grafana/sigil-sdk/go/sigil"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/claudecode/state"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/envconfig"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -74,7 +78,7 @@ func TestHookEventRouting(t *testing.T) {
 					TranscriptPath: transcriptPath,
 				}
 			},
-			wantLogs: []string{"no generations produced; keeping offset="},
+			wantLogs: []string{"no completed assistant turn yet; keeping offset="},
 			assertState: func(t *testing.T) {
 				t.Helper()
 				sessionID := "zero-generation-session"
@@ -106,7 +110,7 @@ func TestHookEventRouting(t *testing.T) {
 			},
 			wantLogs: []string{
 				"read 1 raw lines",
-				"no generations produced; keeping offset=0 for next event",
+				"no completed assistant turn yet; keeping offset=0",
 			},
 		},
 		{
@@ -169,6 +173,109 @@ func TestHookEventRouting(t *testing.T) {
 			}
 			if tt.assertState != nil {
 				tt.assertState(t)
+			}
+		})
+	}
+}
+
+// TestHandlePreToolUse covers Claude-Code-specific wiring around the shared
+// guard helper: ensuring the helper is consulted only when guards are
+// enabled, that allow verdicts produce empty stdout, and that deny verdicts
+// produce the Claude Code PreToolUse envelope (hookSpecificOutput +
+// hookEventName=PreToolUse). Deep behaviour around fail-open/closed,
+// missing credentials, and transport errors lives in the guard package
+// tests; this test only verifies the integration shape.
+func TestHandlePreToolUse(t *testing.T) {
+	var calls atomic.Int32
+	var responseBody atomic.Value
+	responseBody.Store("")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, _ := responseBody.Load().(string)
+		if body == "" {
+			body = `{"action":"allow"}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name               string
+		env                map[string]string
+		serverResponds     string
+		expectServerCall   bool
+		wantStdoutContains []string
+		wantStdoutEmpty    bool
+	}{
+		{
+			name:            "disabled_by_default",
+			wantStdoutEmpty: true,
+		},
+		{
+			name:             "enabled_allow",
+			env:              map[string]string{"SIGIL_GUARDS_ENABLED": "true"},
+			serverResponds:   `{"action":"allow"}`,
+			expectServerCall: true,
+			wantStdoutEmpty:  true,
+		},
+		{
+			name:             "enabled_deny_writes_claude_envelope",
+			env:              map[string]string{"SIGIL_GUARDS_ENABLED": "true"},
+			serverResponds:   `{"action":"deny","reason":"blocked tool"}`,
+			expectServerCall: true,
+			wantStdoutContains: []string{
+				`"hookSpecificOutput"`,
+				`"hookEventName":"PreToolUse"`,
+				`"permissionDecision":"deny"`,
+				`A Grafana AI Observability policy`,
+				`blocked tool`,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SIGIL_GUARDS_ENABLED", "")
+			t.Setenv("SIGIL_GUARDS_FAIL_OPEN", "")
+			t.Setenv("SIGIL_GUARDS_TIMEOUT_MS", "")
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			t.Setenv("SIGIL_ENDPOINT", server.URL)
+			t.Setenv("SIGIL_AUTH_TENANT_ID", "tenant")
+			t.Setenv("SIGIL_AUTH_TOKEN", "token")
+
+			calls.Store(0)
+			responseBody.Store(tt.serverResponds)
+
+			var stdout bytes.Buffer
+			var logs bytes.Buffer
+			input := &hookInput{
+				HookEventName:  "PreToolUse",
+				SessionID:      "s1",
+				TranscriptPath: "/tmp/t.jsonl",
+				ToolName:       "Bash",
+				ToolInput:      json.RawMessage(`{"command":"echo hi"}`),
+				ToolUseID:      "tu_1",
+			}
+			st := state.Session{Model: "claude-sonnet-4"}
+
+			handlePreToolUse(context.Background(), &stdout, input, st, log.New(&logs, "", 0))
+
+			if tt.expectServerCall && calls.Load() == 0 {
+				t.Errorf("expected server call, got 0")
+			}
+			if !tt.expectServerCall && calls.Load() != 0 {
+				t.Errorf("expected no server call, got %d", calls.Load())
+			}
+			if tt.wantStdoutEmpty && stdout.Len() != 0 {
+				t.Errorf("stdout not empty: %q", stdout.String())
+			}
+			for _, want := range tt.wantStdoutContains {
+				if !strings.Contains(stdout.String(), want) {
+					t.Errorf("stdout missing %q\nfull output: %s", want, stdout.String())
+				}
 			}
 		})
 	}
@@ -542,5 +649,54 @@ func TestEmitToolSpans_ErrorStatus(t *testing.T) {
 	}
 	if spans[0].Status().Code != codes.Error {
 		t.Errorf("span status code = %v, want Error", spans[0].Status().Code)
+	}
+}
+
+func TestIsLocalEndpoint(t *testing.T) {
+	cases := map[string]bool{
+		"http://127.0.0.1:9000":        true,
+		"http://127.0.0.1:9000/custom": true,
+		"http://localhost:9000":        true,
+		"http://localhost:9000/custom": true,
+		"http://[::1]:9000":            true,
+		"https://cloud.example.com":    false,
+		"https://127.0.0.1":            false, // https → not the local receiver
+		"":                             false,
+		"http://example.com":           false,
+		// Hostname-confusion attacks: HasPrefix matched these; URL parse
+		// rejects them.
+		"http://localhost.attacker.com": false,
+		"http://127.0.0.1.attacker.com": false,
+		"http://127.0.0.1@attacker.com": false,
+	}
+	for endpoint, want := range cases {
+		t.Run(endpoint, func(t *testing.T) {
+			if got := envconfig.IsLocalEndpoint(endpoint); got != want {
+				t.Fatalf("IsLocalEndpoint(%q) = %v, want %v", endpoint, got, want)
+			}
+		})
+	}
+}
+
+func TestHook_LocalEndpointSkipsCloudAuthCheck(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "local-export-session"
+	transcriptPath := filepath.Join(dir, "transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(buildHookUserJSONL(sessionID, "hey")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SIGIL_ENDPOINT", "http://127.0.0.1:9000")
+	t.Setenv("SIGIL_AUTH_TENANT_ID", "")
+	t.Setenv("SIGIL_AUTH_TOKEN", "")
+	t.Setenv("SIGIL_OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+	logs := runHookForTest(t, hookInput{
+		HookEventName:  "Stop",
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+	})
+	if strings.Contains(logs, "not exporting: missing") {
+		t.Fatalf("local endpoint should bypass cloud auth check; got logs:\n%s", logs)
 	}
 }

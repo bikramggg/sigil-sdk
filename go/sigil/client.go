@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -21,6 +22,20 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// Version is the released version of the Sigil Go SDK. It is stamped into the
+// default generation-export User-Agent (see UserAgent). Released via the
+// go/vX.Y.Z git tag; bump this on release.
+const Version = "0.8.0"
+
+// UserAgent returns the SDK's default generation-export User-Agent product
+// token, "sigil-sdk-go/<Version>". Coding-agent plugins prepend their own token
+// (most-specific first), e.g.
+//
+//	"sigil-plugin-claude-code/" + pluginVersion + " " + sigil.UserAgent()
+func UserAgent() string {
+	return sdkUserAgentProduct + "/" + Version
+}
+
 // Config controls Sigil client behavior.
 type Config struct {
 	GenerationExport GenerationExportConfig
@@ -34,10 +49,10 @@ type Config struct {
 	// generations and tool executions. Per-recording overrides take precedence.
 	ContentCapture ContentCaptureMode
 	// ContentCaptureResolver, when set, is called before each generation,
-	// tool execution, and rating submission to dynamically resolve the content
-	// capture mode. It receives the request context and the recording's
-	// metadata (nil when the recording type has no metadata, e.g. tool
-	// executions).
+	// embedding, tool execution, and rating submission to dynamically resolve
+	// the content capture mode. It receives the request context and the
+	// recording's metadata (nil when the recording type has no metadata, e.g.
+	// tool executions).
 	//
 	// Resolution precedence (highest → lowest):
 	//   1. Per-recording ContentCapture field (explicit override)
@@ -158,9 +173,10 @@ const (
 	defaultGRPCMaxReceiveMessageBytes = 16 << 20
 	defaultGenerationPayloadMaxBytes  = 16 << 20
 
-	sdkMetadataKeyName = "sigil.sdk.name"
-	metadataUserIDKey  = "sigil.user.id"
-	sdkName            = "sdk-go"
+	sdkMetadataKeyName  = "sigil.sdk.name"
+	metadataUserIDKey   = "sigil.user.id"
+	sdkName             = "sdk-go"
+	sdkUserAgentProduct = "sigil-sdk-go"
 
 	spanAttrGenerationID           = "sigil.generation.id"
 	spanAttrConversationID         = "gen_ai.conversation.id"
@@ -326,11 +342,12 @@ type GenerationRecorder struct {
 //
 // All methods are safe to call on a nil or no-op recorder.
 type EmbeddingRecorder struct {
-	client    *Client
-	ctx       context.Context
-	span      trace.Span
-	seed      EmbeddingStart
-	startedAt time.Time
+	client             *Client
+	ctx                context.Context
+	span               trace.Span
+	seed               EmbeddingStart
+	startedAt          time.Time
+	contentCaptureMode ContentCaptureMode
 
 	mu        sync.Mutex
 	ended     bool
@@ -344,12 +361,13 @@ type EmbeddingRecorder struct {
 //
 // All methods are safe to call on a nil or no-op recorder.
 type ToolExecutionRecorder struct {
-	client         *Client
-	ctx            context.Context
-	span           trace.Span
-	seed           ToolExecutionStart
-	startedAt      time.Time
-	includeContent bool
+	client             *Client
+	ctx                context.Context
+	span               trace.Span
+	seed               ToolExecutionStart
+	startedAt          time.Time
+	includeContent     bool
+	contentCaptureMode ContentCaptureMode
 
 	mu        sync.Mutex
 	ended     bool
@@ -541,9 +559,7 @@ func (c *Client) startGeneration(ctx context.Context, start GenerationStart, def
 	}
 	if len(c.config.Tags) > 0 {
 		merged := cloneTags(c.config.Tags)
-		for k, v := range seed.Tags {
-			merged[k] = v
-		}
+		maps.Copy(merged, seed.Tags)
 		seed.Tags = merged
 	}
 
@@ -557,7 +573,7 @@ func (c *Client) startGeneration(ctx context.Context, start GenerationStart, def
 
 	// Resolve content capture mode before the span starts so MetadataOnly never
 	// attaches sensitive content to live span attributes.
-	resolverMode := callContentCaptureResolver(c.config.ContentCaptureResolver, ctx, seed.Metadata)
+	resolverMode := callContentCaptureResolver(ctx, c.config.ContentCaptureResolver, seed.Metadata)
 	clientMode := resolveClientContentCaptureMode(resolveContentCaptureMode(resolverMode, c.config.ContentCapture))
 	ccMode := resolveContentCaptureMode(seed.ContentCapture, clientMode)
 
@@ -577,7 +593,7 @@ func (c *Client) startGeneration(ctx context.Context, start GenerationStart, def
 		ToolChoice:        cloneStringPtr(seed.ToolChoice),
 		ThinkingEnabled:   cloneBoolPtr(seed.ThinkingEnabled),
 	}
-	if ccMode == ContentCaptureModeMetadataOnly {
+	if ccMode == ContentCaptureModeMetadataOnly || ccMode == ContentCaptureModeFullWithMetadataSpans {
 		spanGeneration.ConversationTitle = ""
 	}
 
@@ -633,6 +649,9 @@ func (c *Client) StartEmbedding(ctx context.Context, start EmbeddingStart) (cont
 	}
 	seed.StartedAt = startedAt
 
+	resolverMode := callContentCaptureResolver(ctx, c.config.ContentCaptureResolver, seed.Metadata)
+	effectiveMode := resolveClientContentCaptureMode(resolveContentCaptureMode(resolverMode, c.config.ContentCapture))
+
 	tracer := c.tracer
 	if tracer == nil {
 		tracer = otel.Tracer(instrumentationName)
@@ -646,11 +665,12 @@ func (c *Client) StartEmbedding(ctx context.Context, start EmbeddingStart) (cont
 	span.SetAttributes(embeddingSpanStartAttributes(seed)...)
 
 	return callCtx, &EmbeddingRecorder{
-		client:    c,
-		ctx:       callCtx,
-		span:      span,
-		seed:      seed,
-		startedAt: startedAt,
+		client:             c,
+		ctx:                callCtx,
+		span:               span,
+		seed:               seed,
+		startedAt:          startedAt,
+		contentCaptureMode: effectiveMode,
 	}
 }
 
@@ -708,15 +728,19 @@ func (c *Client) StartToolExecution(ctx context.Context, start ToolExecutionStar
 
 	// Resolve content capture before the span starts so MetadataOnly never
 	// attaches sensitive content to live span attributes.
-	resolverMode := callContentCaptureResolver(c.config.ContentCaptureResolver, ctx, nil)
+	resolverMode := callContentCaptureResolver(ctx, c.config.ContentCaptureResolver, nil)
 	effectiveClientDefault := resolveContentCaptureMode(resolverMode, c.config.ContentCapture)
 	ctxMode, ctxSet := contentCaptureModeFromContext(ctx)
 	toolMode := resolveToolContentCaptureMode(seed.ContentCapture, ctxMode, ctxSet, effectiveClientDefault)
 
 	var includeContent bool
 	switch toolMode {
-	case ContentCaptureModeMetadataOnly:
+	case ContentCaptureModeMetadataOnly, ContentCaptureModeFullWithMetadataSpans:
+		// Tools have no separate gRPC export — FullWithMetadataSpans behaves
+		// like MetadataOnly for tool spans. Drop every content-bearing seed
+		// field before the span attributes pass.
 		seed.ConversationTitle = ""
+		seed.ToolDescription = ""
 	case ContentCaptureModeFull:
 		includeContent = true
 	default:
@@ -737,12 +761,13 @@ func (c *Client) StartToolExecution(ctx context.Context, start ToolExecutionStar
 	span.SetAttributes(toolSpanAttributes(seed)...)
 
 	return callCtx, &ToolExecutionRecorder{
-		client:         c,
-		ctx:            callCtx,
-		span:           span,
-		seed:           seed,
-		startedAt:      startedAt,
-		includeContent: includeContent,
+		client:             c,
+		ctx:                callCtx,
+		span:               span,
+		seed:               seed,
+		startedAt:          startedAt,
+		includeContent:     includeContent,
+		contentCaptureMode: toolMode,
 	}
 }
 
@@ -823,6 +848,7 @@ func (r *GenerationRecorder) End() {
 	normalized := r.normalizeGeneration(generation, completedAt, callErr, extraMeta)
 	applyTraceContextFromSpan(r.span, &normalized)
 
+	initialContentCaptureMode := r.contentCaptureMode
 	sanitizerRan := false
 	if r.client.config.GenerationSanitizer != nil && r.contentCaptureMode != ContentCaptureModeMetadataOnly {
 		sanitizerRan = true
@@ -839,18 +865,56 @@ func (r *GenerationRecorder) End() {
 	// successful sanitizer pass cannot leak via Metadata.
 	syncCanonicalMetadataMirrors(&normalized)
 
-	stampContentCaptureMetadata(&normalized, r.contentCaptureMode)
-	if r.contentCaptureMode == ContentCaptureModeMetadataOnly {
-		stripContent(&normalized, classifyErrorCategory(callErr, false))
+	// Classify the call error category once and reuse it for stripContent
+	// (under MetadataOnly) and the span error text (under MetadataOnly or
+	// FullWithMetadataSpans). Under FullWithMetadataSpans the proto export
+	// must keep the raw error, but the span path must not echo it.
+	callErrorCategory := ""
+	if callErr != nil {
+		callErrorCategory = classifyErrorCategory(callErr, false)
+		if callErrorCategory == "" {
+			callErrorCategory = "sdk_error"
+		}
 	}
 
+	stampContentCaptureMetadata(&normalized, r.contentCaptureMode)
+	if r.contentCaptureMode == ContentCaptureModeMetadataOnly {
+		stripContent(&normalized, callErrorCategory)
+	}
+
+	// spanCallError is the call-error text recorded on the span. Under
+	// MetadataOnly stripContent already replaced normalized.CallError with the
+	// category. Under FullWithMetadataSpans normalized.CallError stays raw for
+	// the gRPC export, so substitute the category for the span path here.
+	spanCallError := normalized.CallError
+	if r.contentCaptureMode == ContentCaptureModeFullWithMetadataSpans && callErr != nil {
+		spanCallError = callErrorCategory
+	}
+	// spanMapError redacts mapping errors on the span under
+	// FullWithMetadataSpans (parity with the other SDKs which already skip
+	// recording mapping errors on spans under both stripped modes). The
+	// MetadataOnly path keeps the existing pre-feature behavior to stay
+	// scoped to this change.
+	redactMapErr := r.contentCaptureMode == ContentCaptureModeFullWithMetadataSpans
+
 	r.span.SetName(generationSpanName(normalized))
-	r.span.SetAttributes(generationSpanAttributes(normalized)...)
-	if sanitizerRan {
+	// FullWithMetadataSpans: proto export keeps full content (normalized stays
+	// untouched), but the span path must drop content-bearing attributes. The
+	// only content-bearing attribute generationSpanAttributes emits is
+	// sigil.conversation.title, so a shallow copy with the title zeroed is
+	// enough; no deep clone needed.
+	spanView := normalized
+	if r.contentCaptureMode == ContentCaptureModeFullWithMetadataSpans {
+		spanView.ConversationTitle = ""
+	}
+	r.span.SetAttributes(generationSpanAttributes(spanView)...)
+	if sanitizerRan && initialContentCaptureMode != ContentCaptureModeFullWithMetadataSpans {
 		// The start span published the raw seed title; overwrite with the
-		// post-sanitizer/strip value so a sanitizer that empties or rewrites
-		// the title doesn't leave the raw value on the span.
-		r.span.SetAttributes(attribute.String(spanAttrConversationTitle, normalized.ConversationTitle))
+		// post-sanitizer value so a sanitizer that empties or rewrites the
+		// title doesn't leave the raw value on the span. Skipped under
+		// FullWithMetadataSpans: the start span already omitted the title and
+		// re-emitting it as "" would violate the absent guarantee.
+		r.span.SetAttributes(attribute.String(spanAttrConversationTitle, spanView.ConversationTitle))
 	}
 
 	r.mu.Lock()
@@ -859,18 +923,24 @@ func (r *GenerationRecorder) End() {
 
 	enqueueErr := r.client.persistGeneration(normalized)
 
-	// Record errors on span. Use normalized.CallError (post-sanitization, post-
-	// strip) for the provider call error so secrets the sanitizer redacted, or
-	// strip replaced with a category, don't leak via exception events.
+	// Record errors on span. spanCallError is the post-sanitization,
+	// post-redaction text: under MetadataOnly and FullWithMetadataSpans the
+	// raw provider message is replaced with the error category so secrets,
+	// prompt fragments, or response text in the provider error don't leak
+	// via exception events or status.
 	if callErr != nil {
 		spanErr := callErr
-		if normalized.CallError != callErr.Error() {
-			spanErr = errors.New(normalized.CallError)
+		if spanCallError != callErr.Error() {
+			spanErr = errors.New(spanCallError)
 		}
 		r.span.RecordError(spanErr)
 	}
 	if mapErr != nil {
-		r.span.RecordError(mapErr)
+		spanMapErr := mapErr
+		if redactMapErr {
+			spanMapErr = errors.New("sdk_error")
+		}
+		r.span.RecordError(spanMapErr)
 	}
 	if enqueueErr != nil {
 		r.span.RecordError(enqueueErr)
@@ -887,9 +957,13 @@ func (r *GenerationRecorder) End() {
 
 	switch {
 	case callErr != nil:
-		r.span.SetStatus(codes.Error, normalized.CallError)
+		r.span.SetStatus(codes.Error, spanCallError)
 	case mapErr != nil:
-		r.span.SetStatus(codes.Error, mapErr.Error())
+		if redactMapErr {
+			r.span.SetStatus(codes.Error, "sdk_error")
+		} else {
+			r.span.SetStatus(codes.Error, mapErr.Error())
+		}
 	case enqueueErr != nil:
 		r.span.SetStatus(codes.Error, enqueueErr.Error())
 	default:
@@ -1001,7 +1075,7 @@ func (r *EmbeddingRecorder) End() {
 	normalized := r.normalizeEmbeddingResult(result)
 
 	r.span.SetName(embeddingSpanName(r.seed.Model.Name))
-	r.span.SetAttributes(embeddingSpanEndAttributes(normalized, hasResult, r.client.config.EmbeddingCapture)...)
+	r.span.SetAttributes(embeddingSpanEndAttributes(normalized, hasResult, r.client.config.EmbeddingCapture, r.contentCaptureMode)...)
 
 	var localErr error
 	if err := ValidateEmbeddingStart(r.seed); err != nil {
@@ -1010,11 +1084,19 @@ func (r *EmbeddingRecorder) End() {
 		localErr = fmt.Errorf("%w: %v", ErrEmbeddingValidationFailed, err)
 	}
 
-	if callErr != nil {
-		r.span.RecordError(callErr)
-	}
-	if localErr != nil {
-		r.span.RecordError(localErr)
+	// Redact span-side error text under both stripped modes. Embeddings
+	// have no proto export, so the raw provider error never escapes the
+	// span path; matches the generation FullWithMetadataSpans contract.
+	redactSpanErrors := r.contentCaptureMode == ContentCaptureModeMetadataOnly ||
+		r.contentCaptureMode == ContentCaptureModeFullWithMetadataSpans
+
+	if !redactSpanErrors {
+		if callErr != nil {
+			r.span.RecordError(callErr)
+		}
+		if localErr != nil {
+			r.span.RecordError(localErr)
+		}
 	}
 
 	errorType := ""
@@ -1023,11 +1105,22 @@ func (r *EmbeddingRecorder) End() {
 	case callErr != nil:
 		errorType = "provider_call_error"
 		errorCategory = classifyErrorCategory(callErr, false)
-		r.span.SetStatus(codes.Error, callErr.Error())
+		if errorCategory == "" {
+			errorCategory = "sdk_error"
+		}
+		if redactSpanErrors {
+			r.span.SetStatus(codes.Error, errorCategory)
+		} else {
+			r.span.SetStatus(codes.Error, callErr.Error())
+		}
 	case localErr != nil:
 		errorType = "validation_error"
 		errorCategory = "sdk_error"
-		r.span.SetStatus(codes.Error, localErr.Error())
+		if redactSpanErrors {
+			r.span.SetStatus(codes.Error, errorCategory)
+		} else {
+			r.span.SetStatus(codes.Error, localErr.Error())
+		}
 	default:
 		r.span.SetStatus(codes.Ok, "")
 	}
@@ -1144,10 +1237,22 @@ func (r *ToolExecutionRecorder) End() {
 		finalErr = contentErr
 	}
 	if finalErr != nil {
-		r.span.RecordError(finalErr)
+		// Tools have no proto export; under both stripped modes the span
+		// must not echo raw provider exception text via record-error
+		// events or the status description.
+		redactSpanErrors := r.contentCaptureMode == ContentCaptureModeMetadataOnly ||
+			r.contentCaptureMode == ContentCaptureModeFullWithMetadataSpans
+		errorCategory := toolErrorCategory(finalErr)
+		if !redactSpanErrors {
+			r.span.RecordError(finalErr)
+		}
 		r.span.SetAttributes(attribute.String(spanAttrErrorType, "tool_execution_error"))
-		r.span.SetAttributes(attribute.String(spanAttrErrorCategory, toolErrorCategory(finalErr)))
-		r.span.SetStatus(codes.Error, finalErr.Error())
+		r.span.SetAttributes(attribute.String(spanAttrErrorCategory, errorCategory))
+		if redactSpanErrors {
+			r.span.SetStatus(codes.Error, errorCategory)
+		} else {
+			r.span.SetStatus(codes.Error, finalErr.Error())
+		}
 	} else {
 		r.span.SetStatus(codes.Ok, "")
 	}
@@ -1316,7 +1421,7 @@ func combineAllErrors(errs ...error) error {
 }
 
 func (c *Client) persistGeneration(generation Generation) error {
-	if err := validateGeneration(generation); err != nil {
+	if err := ValidateGeneration(generation); err != nil {
 		return fmt.Errorf("%w: %v", errGenerationValidation, err)
 	}
 	if err := c.enqueueGeneration(generation); err != nil {
@@ -1397,7 +1502,7 @@ func embeddingSpanStartAttributes(start EmbeddingStart) []attribute.KeyValue {
 	return attrs
 }
 
-func embeddingSpanEndAttributes(result EmbeddingResult, hasResult bool, captureCfg EmbeddingCaptureConfig) []attribute.KeyValue {
+func embeddingSpanEndAttributes(result EmbeddingResult, hasResult bool, captureCfg EmbeddingCaptureConfig, contentCapture ContentCaptureMode) []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 8)
 	if hasResult {
 		attrs = append(attrs, attribute.Int64(spanAttrEmbeddingInputCount, int64(result.InputCount)))
@@ -1411,7 +1516,9 @@ func embeddingSpanEndAttributes(result EmbeddingResult, hasResult bool, captureC
 	if result.Dimensions != nil {
 		attrs = append(attrs, attribute.Int64(spanAttrEmbeddingDimCount, *result.Dimensions))
 	}
-	if captureCfg.CaptureInput {
+	// See ContentCaptureModeFullWithMetadataSpans godoc for the embedding
+	// gating rationale.
+	if captureCfg.CaptureInput && contentCapture != ContentCaptureModeMetadataOnly && contentCapture != ContentCaptureModeFullWithMetadataSpans {
 		if texts := captureEmbeddingInputTexts(result.InputTexts, captureCfg); len(texts) > 0 {
 			attrs = append(attrs, attribute.StringSlice(spanAttrEmbeddingInputTexts, texts))
 		}
@@ -1419,6 +1526,8 @@ func embeddingSpanEndAttributes(result EmbeddingResult, hasResult bool, captureC
 	return attrs
 }
 
+// Do not add prompt, message, tool, artifact, or raw metadata content here
+// without updating the FullWithMetadataSpans span view.
 func generationSpanAttributes(g Generation) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String(spanAttrOperationName, operationName(g)),
@@ -1561,7 +1670,7 @@ func coerceInt64(value any) (int64, bool) {
 	case uint32:
 		return int64(typed), true
 	case uint64:
-		if typed > uint64(^uint64(0)>>1) {
+		if typed > ^uint64(0)>>1 {
 			return 0, false
 		}
 		return int64(typed), true
@@ -2052,9 +2161,7 @@ func mergeTags(base, override map[string]string) map[string]string {
 	if out == nil {
 		out = map[string]string{}
 	}
-	for key, value := range override {
-		out[key] = value
-	}
+	maps.Copy(out, override)
 	return out
 }
 
@@ -2067,9 +2174,7 @@ func mergeMetadata(base, override map[string]any) map[string]any {
 	if out == nil {
 		out = map[string]any{}
 	}
-	for key, value := range override {
-		out[key] = value
-	}
+	maps.Copy(out, override)
 	return out
 }
 

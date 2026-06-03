@@ -28,6 +28,7 @@ from sigil_sdk import (
     ToolCall,
     ToolDefinition,
     ToolExecutionStart,
+    ToolResult,
     WorkflowStep,
     user_text_message,
 )
@@ -74,6 +75,8 @@ _span_attr_framework_langgraph_node = "sigil.framework.langgraph.node"
 _span_attr_framework_event_id = "sigil.framework.event_id"
 _span_attr_error_type = "error.type"
 _span_attr_error_category = "error.category"
+_metadata_thinking_budget_tokens = "sigil.gen_ai.request.thinking.budget_tokens"
+_metadata_thinking_level = "sigil.gen_ai.request.thinking.level"
 _max_framework_metadata_depth = 5
 _metadata_drop = object()
 
@@ -175,6 +178,7 @@ class SigilFrameworkHandlerBase:
         self._graph_root_run_keys: set[str] = set()
         self._graph_run_conversation_id: dict[str, str] = {}
         self._graph_run_last_step_id: dict[str, str] = {}
+        self._graph_run_last_generation_id: dict[str, str] = {}
         # parent_run_id chain for any active run (chain/llm/chat). Used to walk
         # upwards from an LLM run to find the enclosing workflow step.
         self._run_to_graph_key: dict[str, str] = {}
@@ -264,6 +268,7 @@ class SigilFrameworkHandlerBase:
         self._graph_root_run_keys.discard(root_run_key)
         self._graph_run_conversation_id.pop(root_run_key, None)
         self._graph_run_last_step_id.pop(root_run_key, None)
+        self._graph_run_last_generation_id.pop(root_run_key, None)
 
     def _reaches_run(self, start_key: str, target_key: str) -> bool:
         """Return True if walking ``_run_to_graph_key`` from start_key
@@ -342,10 +347,18 @@ class SigilFrameworkHandlerBase:
             metadata[_span_attr_framework_langgraph_node] = langgraph_node
         if event_id != "":
             metadata[_span_attr_framework_event_id] = event_id
+        _add_invocation_control_metadata(metadata, invocation_params)
         metadata = _normalize_framework_metadata(metadata)
 
         if parent_run_id is not None:
             self._run_to_graph_key[run_key] = str(parent_run_id)
+
+        graph_root_key = self._find_graph_root_key(run_key)
+        parent_generation_ids: list[str] = []
+        if graph_root_key:
+            last_generation_id = self._graph_run_last_generation_id.get(graph_root_key, "")
+            if last_generation_id:
+                parent_generation_ids = [last_generation_id]
 
         start = GenerationStart(
             conversation_id=conversation_id,
@@ -356,10 +369,13 @@ class SigilFrameworkHandlerBase:
             model=ModelRef(provider=provider_name, name=model_name),
             tags=tags,
             metadata=metadata,
+            parent_generation_ids=parent_generation_ids,
         )
         if start.id == "":
             start.id = f"gen_{secrets.token_hex(8)}"
         self._track_run_generation_id(run_key, start.id)
+        if graph_root_key:
+            self._graph_run_last_generation_id[graph_root_key] = start.id
 
         recorder = (
             self._client.start_streaming_generation(start)
@@ -435,10 +451,18 @@ class SigilFrameworkHandlerBase:
             metadata[_span_attr_framework_langgraph_node] = langgraph_node
         if event_id != "":
             metadata[_span_attr_framework_event_id] = event_id
+        _add_invocation_control_metadata(metadata, invocation_params)
         metadata = _normalize_framework_metadata(metadata)
 
         if parent_run_id is not None:
             self._run_to_graph_key[run_key] = str(parent_run_id)
+
+        graph_root_key = self._find_graph_root_key(run_key)
+        parent_generation_ids: list[str] = []
+        if graph_root_key:
+            last_generation_id = self._graph_run_last_generation_id.get(graph_root_key, "")
+            if last_generation_id:
+                parent_generation_ids = [last_generation_id]
 
         start = GenerationStart(
             conversation_id=conversation_id,
@@ -455,10 +479,14 @@ class SigilFrameworkHandlerBase:
             max_tokens=_as_optional_int(_read(invocation_params, "max_tokens")),
             top_p=_as_optional_float(_read(invocation_params, "top_p")),
             tool_choice=_as_str(_read(invocation_params, "tool_choice")) or None,
+            thinking_enabled=_as_optional_bool(_read(invocation_params, "thinking_enabled")),
+            parent_generation_ids=parent_generation_ids,
         )
         if start.id == "":
             start.id = f"gen_{secrets.token_hex(8)}"
         self._track_run_generation_id(run_key, start.id)
+        if graph_root_key:
+            self._graph_run_last_generation_id[graph_root_key] = start.id
 
         recorder = (
             self._client.start_streaming_generation(start)
@@ -1275,6 +1303,16 @@ def _resolve_framework_event_id(*payloads: Any) -> str:
     return ""
 
 
+def _add_invocation_control_metadata(metadata: dict[str, Any], invocation_params: dict[str, Any] | None) -> None:
+    thinking_budget = _as_optional_int(_read(invocation_params, "thinking_budget"))
+    if thinking_budget is not None:
+        metadata.setdefault(_metadata_thinking_budget_tokens, thinking_budget)
+
+    thinking_level = _as_str(_read(invocation_params, "thinking_level"))
+    if thinking_level != "":
+        metadata.setdefault(_metadata_thinking_level, thinking_level)
+
+
 def _retry_attempt_from_payload(payload: Any) -> int | None:
     candidates = (
         _as_optional_int(_read(payload, "retry_attempt")),
@@ -1327,16 +1365,33 @@ def _map_chat_inputs(messages: list[list[Any]]) -> list[Message]:
     output: list[Message] = []
     for batch in messages:
         for message in batch:
-            text = _extract_message_text(message)
-            if text == "":
-                continue
-            output.append(
-                Message(
-                    role=_normalize_role(_extract_message_role(message)),
-                    parts=[Part(kind=PartKind.TEXT, text=text)],
-                )
-            )
+            mapped = _map_chat_input_message(message)
+            if mapped is not None:
+                output.append(mapped)
     return output
+
+
+def _map_chat_input_message(message: Any) -> Message | None:
+    parts: list[Part] = []
+
+    text = _extract_message_text(message)
+    if text != "":
+        parts.append(Part(kind=PartKind.TEXT, text=text))
+
+    for tool_call in _as_list(_read(message, "tool_calls")):
+        tool_call_part = _map_langchain_tool_call_part(tool_call)
+        if tool_call_part is not None:
+            parts.append(tool_call_part)
+
+    for tool_result in _as_list(_read(message, "tool_results")):
+        tool_result_part = _map_framework_tool_result_part(tool_result)
+        if tool_result_part is not None:
+            parts.append(tool_result_part)
+
+    if not parts:
+        return None
+
+    return Message(role=_normalize_message_role(message, parts), parts=parts)
 
 
 def _map_output_messages(response: Any) -> list[Message]:
@@ -1383,10 +1438,15 @@ def _map_generation_candidate_message(candidate: Any) -> Message | None:
         if tool_call_part is not None:
             parts.append(tool_call_part)
 
+    for tool_result in _as_list(_read(message, "tool_results")):
+        tool_result_part = _map_framework_tool_result_part(tool_result)
+        if tool_result_part is not None:
+            parts.append(tool_result_part)
+
     if not parts:
         return None
 
-    return Message(role=_normalize_role(_extract_message_role(message)), parts=parts)
+    return Message(role=_normalize_message_role(message, parts), parts=parts)
 
 
 def _map_langchain_tool_call_part(tool_call: Any) -> Part | None:
@@ -1404,6 +1464,39 @@ def _map_langchain_tool_call_part(tool_call: Any) -> Part | None:
             id=_as_str(_read(tool_call, "id")),
             name=name,
             input_json=_json_bytes(args),
+        ),
+    )
+
+
+def _map_framework_tool_result_part(tool_result: Any) -> Part | None:
+    response = _read(tool_result, "response")
+    content = _read(tool_result, "content")
+    if content is None and isinstance(response, str):
+        content = response
+
+    content_json = _first_present(
+        _read(tool_result, "content_json"),
+        _read(tool_result, "contentJson"),
+    )
+    if content_json is None and response is not None and not isinstance(response, str):
+        content_json = response
+
+    if content is None and content_json is None:
+        return None
+
+    return Part(
+        kind=PartKind.TOOL_RESULT,
+        tool_result=ToolResult(
+            tool_call_id=_first_non_empty_str(
+                _read(tool_result, "tool_call_id"),
+                _read(tool_result, "toolCallId"),
+                _read(tool_result, "call_id"),
+                _read(tool_result, "id"),
+            ),
+            name=_as_str(_read(tool_result, "name")),
+            content=_as_str(content),
+            content_json=content_json if isinstance(content_json, bytes) else _json_bytes(content_json),
+            is_error=_as_bool(_read(tool_result, "is_error")),
         ),
     )
 
@@ -1473,11 +1566,17 @@ def _map_framework_usage(raw_usage: Any):
 
 def _normalize_role(role: str) -> MessageRole:
     normalized = role.strip().lower()
-    if normalized in {"assistant", "ai"}:
+    if normalized in {"assistant", "ai", "model"}:
         return MessageRole.ASSISTANT
     if normalized == "tool":
         return MessageRole.TOOL
     return MessageRole.USER
+
+
+def _normalize_message_role(message: Any, parts: list[Part]) -> MessageRole:
+    if any(part.kind == PartKind.TOOL_RESULT for part in parts):
+        return MessageRole.TOOL
+    return _normalize_role(_extract_message_role(message))
 
 
 def _read(value: Any, key: str) -> Any:
@@ -1492,6 +1591,21 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return []
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _first_non_empty_str(*values: Any) -> str:
+    for value in values:
+        text = _as_str(value)
+        if text != "":
+            return text
+    return ""
 
 
 def _as_str(value: Any) -> str:
@@ -1591,6 +1705,22 @@ def _as_optional_float(value: Any) -> float | None:
             return float(stripped)
         except ValueError:
             return None
+    return None
+
+
+def _as_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, int):
+        return value != 0
     return None
 
 

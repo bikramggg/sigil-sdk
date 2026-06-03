@@ -3,6 +3,7 @@ package mapper
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,8 +13,8 @@ import (
 
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/codexlog"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/fragment"
-	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/codex/util"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/redact"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/timeutil"
 )
 
 const (
@@ -40,8 +41,8 @@ func Map(in Inputs) Mapped {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	completedAt := util.ParseTimestamp(frag.CompletedAt, util.ParseTimestamp(frag.LastEventAt, now))
-	startedAt := util.ParseTimestamp(frag.StartedAt, completedAt)
+	completedAt := timeutil.ParseTimestamp(frag.CompletedAt, timeutil.ParseTimestamp(frag.LastEventAt, now))
+	startedAt := timeutil.ParseTimestamp(frag.StartedAt, completedAt)
 	mode := in.ContentCapture
 	if mode == sigil.ContentCaptureModeDefault {
 		mode = sigil.ContentCaptureModeMetadataOnly
@@ -196,9 +197,7 @@ func cloneStringMap(in map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }
 
@@ -207,9 +206,7 @@ func cloneAnyMap(in map[string]any) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }
 

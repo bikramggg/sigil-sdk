@@ -19,6 +19,8 @@ import (
 const (
 	agentName       = "claude-code"
 	maxToolInputLen = 4096
+	// maxTitleLen caps the conversation title derived from the first user prompt.
+	maxTitleLen = 100
 )
 
 // Options controls how transcript lines are mapped to generations.
@@ -41,14 +43,30 @@ type userContext struct {
 
 // Coalesce merges consecutive assistant lines sharing the same RequestID
 // into a single line with merged content blocks and the final line's metadata.
-// Returns the coalesced lines and a safe byte offset that only covers complete
-// request groups (trailing incomplete assistant groups are excluded).
+// It returns only the safe prefix ending at the last complete assistant turn.
+// Trailing prompts, tool results, and incomplete assistant fragments are left
+// out so the next hook invocation re-reads them from the unchanged offset.
 func Coalesce(lines []transcript.Line) ([]transcript.Line, int64) {
 	var (
 		result         []transcript.Line
 		pending        []transcript.Line
+		lastSafeLen    int
 		lastSafeOffset int64
 	)
+
+	markSafe := func(offset int64) {
+		lastSafeLen = len(result)
+		lastSafeOffset = offset
+	}
+
+	appendAssistantIfComplete := func(line transcript.Line) {
+		var msg transcript.AssistantMessage
+		if err := json.Unmarshal(line.Message, &msg); err != nil || msg.StopReason == "" {
+			return
+		}
+		result = append(result, line)
+		markSafe(line.EndOffset)
+	}
 
 	flush := func() {
 		if len(pending) == 0 {
@@ -57,30 +75,34 @@ func Coalesce(lines []transcript.Line) ([]transcript.Line, int64) {
 		last := pending[len(pending)-1]
 		var msg transcript.AssistantMessage
 		if err := json.Unmarshal(last.Message, &msg); err == nil && msg.StopReason != "" {
-			merged := mergeAssistantGroup(pending)
-			result = append(result, merged)
-			lastSafeOffset = last.EndOffset
+			result = append(result, mergeAssistantGroup(pending))
+			markSafe(last.EndOffset)
 		}
 		// Incomplete group (no terminal stop_reason): excluded,
-		// offset not advanced — will be re-read next invocation.
+		// offset not advanced; will be re-read next invocation.
 		pending = nil
 	}
 
 	for _, line := range lines {
-		if line.Type == "assistant" && line.RequestID != "" {
+		if line.Type == "assistant" {
+			if line.RequestID == "" {
+				flush()
+				appendAssistantIfComplete(line)
+				continue
+			}
 			if len(pending) > 0 && pending[0].RequestID != line.RequestID {
 				flush()
 			}
 			pending = append(pending, line)
-		} else {
-			flush()
-			result = append(result, line)
-			lastSafeOffset = line.EndOffset
+			continue
 		}
+
+		flush()
+		result = append(result, line)
 	}
 	flush()
 
-	return result, lastSafeOffset
+	return result[:lastSafeLen], lastSafeOffset
 }
 
 func mergeAssistantGroup(lines []transcript.Line) transcript.Line {
@@ -165,7 +187,36 @@ func Process(lines []transcript.Line, st *state.Session, opts Options, r *redact
 		}
 	}
 
+	title := conversationTitle(st, opts.SessionID, r)
+	for i := range gens {
+		gens[i].ConversationTitle = title
+	}
+
 	return gens
+}
+
+// conversationTitle returns a truncated version of the session title derived
+// from the first user prompt. Falls back to the session ID when no title is
+// available (e.g. transcript with no user lines processed yet).
+func conversationTitle(st *state.Session, sessionID string, r *redact.Redactor) string {
+	if st == nil || st.Title == "" {
+		return sessionID
+	}
+	t := strings.TrimSpace(st.Title)
+	if r != nil {
+		t = r.RedactLightweight(t)
+	}
+	if t == "" {
+		return sessionID
+	}
+	if len(t) > maxTitleLen {
+		t = t[:maxTitleLen]
+		// Truncate to valid UTF-8 boundary
+		for !utf8.ValidString(t) {
+			t = t[:len(t)-1]
+		}
+	}
+	return t
 }
 
 // synthesiseSubagentGens creates a generation for each Agent tool result in
@@ -289,6 +340,9 @@ func processAssistantLine(line transcript.Line, uctx *userContext, _ *state.Sess
 		return sigil.Generation{}, false
 	}
 
+	// Zero-token assistant lines are Claude Code's client-side socket-error
+	// recovery markers ("API Error: The socket connection was closed..."),
+	// not real LLM turns.
 	if msg.Usage.OutputTokens <= 0 {
 		return sigil.Generation{}, false
 	}
@@ -318,11 +372,13 @@ func processAssistantLine(line transcript.Line, uctx *userContext, _ *state.Sess
 			Provider: "anthropic",
 			Name:     msg.Model,
 		},
-		Usage:       usage,
-		StopReason:  msg.StopReason,
-		StartedAt:   completedAt, // no real start time; set equal to avoid zero-value skip in SDK metrics
-		CompletedAt: completedAt,
-		Tags:        buildTags(line, isSidechain, opts.ExtraTags),
+		ResponseID:    strings.TrimSpace(line.RequestID),
+		ResponseModel: msg.Model,
+		Usage:         usage,
+		StopReason:    msg.StopReason,
+		StartedAt:     completedAt, // no real start time; set equal to avoid zero-value skip in SDK metrics
+		CompletedAt:   completedAt,
+		Tags:          buildTags(line, isSidechain, opts.ExtraTags),
 	}
 
 	toolNames := map[string]bool{}
@@ -358,9 +414,7 @@ func buildTags(line transcript.Line, subagent bool, extras map[string]string) ma
 	tags := make(map[string]string, 4+len(extras))
 	// Extras go in first; built-ins written below overwrite any collisions
 	// so user-supplied keys can never shadow git.branch/cwd/entrypoint/subagent.
-	for k, v := range extras {
-		tags[k] = v
-	}
+	maps.Copy(tags, extras)
 	if line.GitBranch != "" {
 		tags["git.branch"] = line.GitBranch
 	}

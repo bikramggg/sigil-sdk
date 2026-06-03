@@ -24,10 +24,11 @@ config = with_sigil_langgraph_callbacks(None, client=client, provider_resolver="
 ```python
 from typing import TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from sigil_sdk import Client
-from sigil_sdk_langgraph import SigilLangGraphHandler, with_sigil_langgraph_callbacks
+from sigil_sdk_langgraph import with_sigil_langgraph_callbacks
 
 
 class GraphState(TypedDict):
@@ -36,21 +37,15 @@ class GraphState(TypedDict):
 
 
 client = Client()
-handler = SigilLangGraphHandler(
-    client=client,
-    provider_resolver="auto",
-    agent_name="langgraph-example",
-    agent_version="1.0.0",
-)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
-def run_model(state: GraphState) -> GraphState:
+def run_model(state: GraphState, config: RunnableConfig) -> GraphState:
     response = llm.invoke(
         state["prompt"],
-        config=with_sigil_langgraph_callbacks(None, client=client, provider_resolver="auto"),
+        config=config,
     )
-    return {"prompt": state["prompt"], "answer": response.content}
+    return {"prompt": state["prompt"], "answer": str(response.content).strip()}
 
 
 workflow = StateGraph(GraphState)
@@ -59,13 +54,25 @@ workflow.set_entry_point("model")
 workflow.add_edge("model", END)
 graph = workflow.compile()
 
+sigil_config = with_sigil_langgraph_callbacks(
+    None,
+    client=client,
+    provider_resolver="auto",
+    agent_name="langgraph-example",
+    agent_version="1.0.0",
+)
+
 # Non-stream graph invocation.
-out = graph.invoke({"prompt": "Explain SLO burn rate in one paragraph.", "answer": ""})
+out = graph.invoke(
+    {"prompt": "Explain SLO burn rate in one paragraph.", "answer": ""},
+    config=sigil_config,
+)
 print(out["answer"])
 
 # Streamed graph events.
 for _event in graph.stream(
     {"prompt": "List three practical alerting tips.", "answer": ""},
+    config=sigil_config,
 ):
     pass
 
@@ -93,7 +100,12 @@ handler = SigilLangGraphHandler(
     capture_workflow_steps=True,
 )
 
-result = graph.invoke(input, config={"callbacks": [handler]})
+# Reuse the `graph` from the end-to-end example above. The node must pass its
+# received `config` into `llm.invoke(...)` so generations link to the workflow step.
+result = graph.invoke(
+    {"prompt": "Explain why my dashboard is slow.", "answer": ""},
+    config={"callbacks": [handler]},
+)
 client.shutdown()
 ```
 
@@ -132,6 +144,52 @@ When `thread_id` is present, the handler records:
 - `metadata["sigil.framework.run_id"]=<run id>`
 - `metadata["sigil.framework.thread_id"]=<thread id>`
 - generation span attributes `sigil.framework.run_id` and `sigil.framework.thread_id`
+
+## Experiments (offline evaluation)
+
+Run a LangGraph agent over a dataset as a Sigil experiment, grade locally, and
+publish scores you can compare in the Sigil UI. The runner rides on the callback
+handler above, so generations emitted during the run are auto-tagged with the
+experiment `run_id`.
+
+```python
+from sigil_sdk import ScoreValue
+from sigil_sdk_langgraph import DatasetItem, ExperimentRunner, ScoreOutput, TargetResult
+
+dataset = [
+    DatasetItem(id="capital-fr", input="Capital of France?", expected="Paris",
+                metadata={"task_id": "capital", "task_category": "trivia"}),
+]
+
+def target(item, run):
+    # Pass run.langgraph_config() so generations carry the experiment run_id.
+    out = graph.invoke({"prompt": item.input, "answer": ""}, config=run.langgraph_config())
+    return TargetResult(output=out["answer"])  # generation ids captured automatically
+
+def exact_match(item, result):
+    passed = str(item.expected).lower() in str(result.output).lower()
+    return [ScoreOutput(evaluator_id="suite.exact_match", evaluator_version="2026-05-28",
+                        score_key="exact_match", value=ScoreValue(number=1.0 if passed else 0.0),
+                        passed=passed)]
+
+runner = ExperimentRunner(client=client, run_id="pr-123", name="PR 123",
+                          dataset={"id": "smoke", "version": "2026-05-28"}, tags=["ci"])
+result = runner.run(dataset, target, [exact_match])
+print(result.url)  # deep link to the experiment in Sigil
+```
+
+The runner creates the run (`source="external"`), runs + grades each item,
+exports scores attributed to the `run_id`, and finalizes the run (`succeeded` on
+clean exit, `failed` on exception, `canceled` on Ctrl-C). For ad-hoc loops use
+the lower-level `experiment(...)` context manager. A/B testing is two runs with
+different `run_id`/`tags`. See the `sigil-langgraph-experiments` skill
+(`skills/sigil-langgraph-experiments/SKILL.md`) and the runnable example at
+`examples/python-langgraph-experiment/` for grading patterns (including
+LLM-as-judge) and uploading older runs.
+
+Upload modes: `continuous` (default, publish per item), `bulk` (publish at the
+end), `manual` (publish + finalize only when you call `run.publish()` /
+`run.finalize()`).
 
 ## Behavior
 

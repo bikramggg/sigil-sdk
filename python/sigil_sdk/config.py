@@ -28,7 +28,7 @@ _DEFAULT_PROTOCOL = "grpc"
 _DEFAULT_INSECURE = False
 _DEFAULT_AUTH_MODE = "none"
 _VALID_AUTH_MODES = ("none", "tenant", "bearer", "basic")
-_VALID_CONTENT_CAPTURE = ("full", "no_tool_content", "metadata_only")
+_VALID_CONTENT_CAPTURE = ("full", "no_tool_content", "metadata_only", "full_with_metadata_spans")
 
 
 @dataclass(slots=True)
@@ -210,8 +210,9 @@ def resolve_config(
     log = logging.getLogger("sigil_sdk")
 
     # Transport
+    env_endpoint = _env(env, "SIGIL_ENDPOINT")
     if out.generation_export.endpoint is None:
-        out.generation_export.endpoint = _env(env, "SIGIL_ENDPOINT") or _DEFAULT_ENDPOINT
+        out.generation_export.endpoint = env_endpoint or _DEFAULT_ENDPOINT
     if out.generation_export.protocol is None:
         out.generation_export.protocol = _env(env, "SIGIL_PROTOCOL") or _DEFAULT_PROTOCOL
     if out.generation_export.insecure is None:
@@ -284,7 +285,9 @@ def resolve_config(
     if out.generation_export_endpoint:
         out.generation_export.endpoint = out.generation_export_endpoint
     if out.api.endpoint.strip() == "":
-        out.api.endpoint = "http://localhost:8080"
+        out.api.endpoint = env_endpoint or "http://localhost:8080"
+    elif env_endpoint and out.api.endpoint == ApiConfig().endpoint:
+        out.api.endpoint = env_endpoint
 
     out.generation_export.headers = _resolve_export_headers(
         out.generation_export.headers,
@@ -363,6 +366,8 @@ def _content_capture_from_str(value: str) -> ContentCaptureMode:
         return ContentCaptureMode.NO_TOOL_CONTENT
     if value == "metadata_only":
         return ContentCaptureMode.METADATA_ONLY
+    if value == "full_with_metadata_spans":
+        return ContentCaptureMode.FULL_WITH_METADATA_SPANS
     return ContentCaptureMode.DEFAULT
 
 

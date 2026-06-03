@@ -15,6 +15,7 @@ import (
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/cursor/fragment"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/cursor/mapper"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/otel"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/useragent"
 )
 
 // otelInstrumentationName is the OTel instrumentation scope name attached
@@ -29,12 +30,12 @@ const otelInstrumentationName = "sigil.cursor"
 // SDK reads transport env vars (endpoint, headers, insecure, protocol)
 // natively; the plugin only provides convenience auth-header injection from
 // SIGIL_AUTH_*.
-func setupOTelIfConfigured(ctx context.Context, logger *log.Logger) *otel.Providers {
+func setupOTelIfConfigured(ctx context.Context, instanceID string, logger *log.Logger) *otel.Providers {
 	endpoint := otel.EndpointFromEnv()
 	if endpoint == "" {
 		return nil
 	}
-	providers, err := otel.Setup(ctx)
+	providers, err := otel.Setup(ctx, instanceID)
 	if err != nil {
 		logger.Printf("otel: setup: %v", err)
 		return nil
@@ -50,14 +51,19 @@ func setupOTelIfConfigured(ctx context.Context, logger *log.Logger) *otel.Provid
 // already injected dotenv values into the OS env). The plugin only owns the
 // pieces the SDK can't infer: HTTP protocol, the `/api/v1/generations:export`
 // path suffix, basic-auth mode, and the OTel tracer/meter wiring.
+func exportConfig() sigil.GenerationExportConfig {
+	return sigil.GenerationExportConfig{
+		Protocol: sigil.GenerationExportProtocolHTTP,
+		Endpoint: strings.TrimRight(os.Getenv("SIGIL_ENDPOINT"), "/") + "/api/v1/generations:export",
+		Headers:  map[string]string{"User-Agent": useragent.For("cursor")},
+		Auth:     sigil.AuthConfig{Mode: sigil.ExportAuthModeBasic},
+	}
+}
+
 func buildClient(cfg config.Config, providers *otel.Providers) *sigil.Client {
 	c := sigil.Config{
-		ContentCapture: cfg.ContentCapture,
-		GenerationExport: sigil.GenerationExportConfig{
-			Protocol: sigil.GenerationExportProtocolHTTP,
-			Endpoint: strings.TrimRight(os.Getenv("SIGIL_ENDPOINT"), "/") + "/api/v1/generations:export",
-			Auth:     sigil.AuthConfig{Mode: sigil.ExportAuthModeBasic},
-		},
+		ContentCapture:   cfg.ContentCapture,
+		GenerationExport: exportConfig(),
 	}
 	if providers != nil {
 		c.Tracer = providers.Tracer(otelInstrumentationName)

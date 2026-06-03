@@ -12,6 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/local"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/updatecheck"
 )
 
 const (
@@ -24,6 +28,8 @@ const (
 	// PluginName is the plugin name declared in
 	// plugins/claude-code/.claude-plugin/plugin.json.
 	PluginName = "sigil-cc"
+
+	updateCheckTTL = 24 * time.Hour
 )
 
 // Test seams.
@@ -31,14 +37,18 @@ var (
 	lookPath   = exec.LookPath
 	execFn     = syscall.Exec
 	runInstall = defaultRunInstall
+	runUpdate  = defaultRunUpdate
 	getwd      = os.Getwd
 )
 
 // Launch resolves the `claude` binary on PATH, ensures the sigil-cc plugin
 // is registered in Claude Code's plugin store (running `claude plugin
 // marketplace add` + `claude plugin install` once if it is not), and then
-// exec's claude with the supplied args.
-func Launch(ctx context.Context, args []string, _ io.Reader, _, stderr io.Writer, logger *log.Logger) error {
+// exec's claude with the supplied args. When localEnv is non-nil, the
+// child receives local-mode SIGIL_ENDPOINT, SIGIL_OTEL_EXPORTER_OTLP_ENDPOINT
+// and placeholder auth values so it talks to the in-process receiver
+// instead of Sigil Cloud.
+func Launch(ctx context.Context, args []string, localEnv *local.LaunchEnv, _ io.Reader, _, stderr io.Writer, logger *log.Logger, sigilVersion string) error {
 	bin, err := lookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude CLI not found on PATH: %w", err)
@@ -68,20 +78,43 @@ func Launch(ctx context.Context, args []string, _ io.Reader, _, stderr io.Writer
 					"          claude plugin install %s@%s\n",
 				PluginName, err, PluginName, marketplaceAlias)
 		}
+	} else if updatecheck.ShouldRun(PluginName, updateCheckTTL, sigilVersion) {
+		_, _ = fmt.Fprintf(stderr, "sigil: refreshing %s in claude\n", PluginName)
+		if err := runUpdate(ctx, bin, stderr); err != nil {
+			logger.Printf("update %s: %v", PluginName, err)
+			_, _ = fmt.Fprintf(stderr,
+				"sigil: update of %s failed: %v\n"+
+					"sigil: continuing with the installed version. To retry manually:\n"+
+					"          claude plugin marketplace update %s\n"+
+					"          claude plugin update %s@%s\n",
+				PluginName, err, marketplaceAlias, PluginName, marketplaceAlias)
+		}
+		updatecheck.Record(PluginName, sigilVersion)
 	}
 
+	env := local.Environ(localEnv)
 	argv := append([]string{bin}, args...)
-	if err := execFn(bin, argv, os.Environ()); err != nil {
+	if err := execFn(bin, argv, env); err != nil {
 		return fmt.Errorf("exec claude: %w", err)
 	}
 	return nil
 }
 
 func defaultRunInstall(ctx context.Context, bin string, w io.Writer) error {
-	steps := [][]string{
+	return runSteps(ctx, bin, w, [][]string{
 		{"plugin", "marketplace", "add", marketplaceRepo},
 		{"plugin", "install", PluginName + "@" + marketplaceAlias},
-	}
+	})
+}
+
+func defaultRunUpdate(ctx context.Context, bin string, w io.Writer) error {
+	return runSteps(ctx, bin, w, [][]string{
+		{"plugin", "marketplace", "update", marketplaceAlias},
+		{"plugin", "update", PluginName + "@" + marketplaceAlias},
+	})
+}
+
+func runSteps(ctx context.Context, bin string, w io.Writer, steps [][]string) error {
 	for _, argv := range steps {
 		cmd := exec.CommandContext(ctx, bin, argv...)
 		cmd.Stdout = w

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "sessionStart"
             },
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "sessionEnd"
             },
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "userPromptSubmitted"
             },
@@ -44,11 +44,10 @@
     ],
     "preToolUse": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "preToolUse"
             },
@@ -59,11 +58,10 @@
     ],
     "postToolUse": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "postToolUse"
             },
@@ -74,11 +72,10 @@
     ],
     "postToolUseFailure": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "postToolUseFailure"
             },
@@ -92,7 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "errorOccurred"
             },
@@ -106,7 +103,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "subagentStart"
             },
@@ -120,7 +117,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "subagentStop"
             },
@@ -134,7 +131,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sigil-copilot",
+            "command": "sigil copilot hook",
             "env": {
               "SIGIL_COPILOT_HOOK_EVENT": "agentStop"
             },

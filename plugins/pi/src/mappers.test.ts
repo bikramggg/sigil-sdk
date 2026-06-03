@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  extractRequestControls,
+  MAX_TITLE_LEN,
   mapGenerationResult,
   mapGenerationStart,
-  mapToolNames,
+  mapTools,
   mapUserMessage,
   type PiAssistantMessage,
+  type PiToolInfo,
   type PiToolResult,
   type PiUserMessage,
-  type ToolTiming,
+  resolveConversationTitle,
+  userMessageText,
 } from "./mappers.js";
 
 function makeMsg(overrides?: Partial<PiAssistantMessage>): PiAssistantMessage {
@@ -58,28 +62,27 @@ function makeUserMsg(overrides?: Partial<PiUserMessage>): PiUserMessage {
   };
 }
 
-function makeTiming(overrides?: Partial<ToolTiming>): ToolTiming {
+function makeToolInfo(overrides?: Partial<PiToolInfo>): PiToolInfo {
   return {
-    toolCallId: "call-1",
-    toolName: "bash",
-    startedAt: 1700000000500,
-    completedAt: 1700000001500,
-    isError: false,
+    name: "bash",
+    description: "Run a shell command",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
     ...overrides,
   };
 }
 
 describe("mapGenerationStart", () => {
   it("maps model, conversation, agent info", () => {
-    const msg = makeMsg();
-    const start = mapGenerationStart(
-      msg,
-      "session-abc",
-      "pi",
-      "1.0.0",
-      1700000000000,
-      undefined,
-    );
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "session-abc",
+      agentName: "pi",
+      agentVersion: "1.0.0",
+      startedAt: 1700000000000,
+    });
     expect(start.model).toEqual({
       provider: "anthropic",
       name: "claude-sonnet-4-20250514",
@@ -90,11 +93,31 @@ describe("mapGenerationStart", () => {
     expect(start.startedAt).toEqual(new Date(1700000000000));
   });
 
-  it("includes tools whenever provided", () => {
-    const msg = makeMsg();
-    const tools = [{ name: "bash" }, { name: "read" }];
+  it("sets conversationTitle when provided and omits it when empty", () => {
+    const withTitle = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      conversationTitle: "summarize the go files",
+      agentName: "pi",
+      startedAt: 0,
+    });
+    expect(withTitle.conversationTitle).toBe("summarize the go files");
 
-    const result = mapGenerationStart(msg, "s", "pi", undefined, 0, tools);
+    const without = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
+    expect(without.conversationTitle).toBeUndefined();
+  });
+
+  it("includes tools whenever provided", () => {
+    const tools = [{ name: "bash" }, { name: "read" }];
+    const result = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      tools,
+    });
     expect(result.tools).toEqual(tools);
   });
 
@@ -105,80 +128,186 @@ describe("mapGenerationStart", () => {
         { type: "text", text: "answer" },
       ],
     });
-    const start = mapGenerationStart(
-      msg,
-      undefined,
-      "pi",
-      undefined,
-      0,
-      undefined,
-    );
+    const start = mapGenerationStart(msg, { agentName: "pi", startedAt: 0 });
     expect(start.thinkingEnabled).toBe(true);
   });
 
   it("omits thinkingEnabled when no thinking blocks present", () => {
-    const start = mapGenerationStart(
-      makeMsg(),
-      undefined,
-      "pi",
-      undefined,
-      0,
-      undefined,
-    );
+    const start = mapGenerationStart(makeMsg(), {
+      agentName: "pi",
+      startedAt: 0,
+    });
     expect(start.thinkingEnabled).toBeUndefined();
   });
 
   it("propagates agentVersion into effectiveVersion", () => {
     const msg = makeMsg();
-    const a = mapGenerationStart(msg, "s", "pi", "1.4.7", 0, [
-      { name: "bash" },
-    ]);
-    const b = mapGenerationStart(msg, "s", "pi", "1.4.7", 0, [
-      { name: "read" },
-    ]);
+    const a = mapGenerationStart(msg, {
+      conversationId: "s",
+      agentName: "pi",
+      agentVersion: "1.4.7",
+      startedAt: 0,
+      tools: [{ name: "bash" }],
+    });
+    const b = mapGenerationStart(msg, {
+      conversationId: "s",
+      agentName: "pi",
+      agentVersion: "1.4.7",
+      startedAt: 0,
+      tools: [{ name: "read" }],
+    });
     expect(a.effectiveVersion).toBe("1.4.7");
     expect(a.effectiveVersion).toBe(b.effectiveVersion);
     expect(a.effectiveVersion).toBe(a.agentVersion);
   });
 
   it("leaves effectiveVersion unset when agentVersion is missing", () => {
-    const start = mapGenerationStart(
-      makeMsg(),
-      "s",
-      "pi",
-      undefined,
-      0,
-      undefined,
-    );
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
     expect(start.effectiveVersion).toBeUndefined();
   });
 
   it("attaches tags when provided", () => {
-    const start = mapGenerationStart(
-      makeMsg(),
-      "s",
-      "pi",
-      undefined,
-      0,
-      undefined,
-      { "git.branch": "main" },
-    );
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      tags: { "git.branch": "main" },
+    });
     expect(start.tags).toEqual({ "git.branch": "main" });
   });
 
   it("omits tags when empty or undefined", () => {
-    const a = mapGenerationStart(
-      makeMsg(),
-      "s",
-      "pi",
-      undefined,
-      0,
-      undefined,
-      {},
-    );
-    const b = mapGenerationStart(makeMsg(), "s", "pi", undefined, 0, undefined);
+    const a = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      tags: {},
+    });
+    const b = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
     expect(a.tags).toBeUndefined();
     expect(b.tags).toBeUndefined();
+  });
+
+  it("sets systemPrompt when provided and non-empty", () => {
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      systemPrompt: "You are a helpful agent.",
+    });
+    expect(start.systemPrompt).toBe("You are a helpful agent.");
+  });
+
+  it("omits systemPrompt when undefined or empty", () => {
+    const a = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
+    const b = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      systemPrompt: "",
+    });
+    expect(a.systemPrompt).toBeUndefined();
+    expect(b.systemPrompt).toBeUndefined();
+  });
+
+  it("sets request controls when provided", () => {
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      requestControls: {
+        maxTokens: 1024,
+        temperature: 0.2,
+        topP: 0.9,
+        toolChoice: "auto",
+        thinkingBudgetTokens: 4096,
+      },
+    });
+    expect(start.maxTokens).toBe(1024);
+    expect(start.temperature).toBe(0.2);
+    expect(start.topP).toBe(0.9);
+    expect(start.toolChoice).toBe("auto");
+    expect(start.metadata).toEqual({
+      "sigil.gen_ai.request.thinking.budget_tokens": 4096,
+    });
+  });
+
+  it("leaves request controls unset when fields are missing", () => {
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      requestControls: {},
+    });
+    expect(start.maxTokens).toBeUndefined();
+    expect(start.temperature).toBeUndefined();
+    expect(start.topP).toBeUndefined();
+    expect(start.toolChoice).toBeUndefined();
+    expect(start.metadata).toBeUndefined();
+  });
+
+  it("copies generationId to start.id when set", () => {
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      generationId: "pi-abcdef0123456789abcdef01",
+    });
+    expect(start.id).toBe("pi-abcdef0123456789abcdef01");
+  });
+
+  it("omits start.id when generationId is missing or empty", () => {
+    const a = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
+    const b = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      generationId: "",
+    });
+    expect(a.id).toBeUndefined();
+    expect(b.id).toBeUndefined();
+  });
+
+  it("copies parentGenerationIds when set", () => {
+    const start = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      parentGenerationIds: ["pi-deadbeefcafebabe00010203"],
+    });
+    expect(start.parentGenerationIds).toEqual(["pi-deadbeefcafebabe00010203"]);
+  });
+
+  it("omits parentGenerationIds when empty or undefined", () => {
+    const a = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+    });
+    const b = mapGenerationStart(makeMsg(), {
+      conversationId: "s",
+      agentName: "pi",
+      startedAt: 0,
+      parentGenerationIds: [],
+    });
+    expect(a.parentGenerationIds).toBeUndefined();
+    expect(b.parentGenerationIds).toBeUndefined();
   });
 });
 
@@ -359,6 +488,71 @@ describe("mapGenerationResult", () => {
     expect(roles).toContain("tool");
   });
 
+  it("full_with_metadata_spans matches full for proto-export tool bodies", () => {
+    // Per the SDK contract (ContentCaptureModeFullWithMetadataSpans in
+    // go/sigil/content_capture.go), the proto export gets full generation
+    // content under this mode; only the OTel span side is reduced.
+    const msg = makeMsg({
+      content: [
+        { type: "text", text: "I'll run that command" },
+        {
+          type: "toolCall",
+          id: "c1",
+          name: "bash",
+          arguments: { command: "ls" },
+        },
+      ],
+    });
+    const toolResults = [
+      makeToolResult({
+        toolCallId: "c1",
+        content: [{ type: "text", text: "file.txt" }],
+      }),
+    ];
+    const result = mapGenerationResult(
+      msg,
+      toolResults,
+      "full_with_metadata_spans",
+    );
+
+    const toolCallPart = result.output
+      ?.flatMap((m) => m.parts ?? [])
+      .find((p) => p.type === "tool_call");
+    expect(
+      (toolCallPart as { toolCall: { inputJSON: string } }).toolCall.inputJSON,
+    ).toBe(JSON.stringify({ command: "ls" }));
+
+    const toolResultPart = result.output
+      ?.flatMap((m) => m.parts ?? [])
+      .find((p) => p.type === "tool_result");
+    expect(
+      (toolResultPart as { toolResult: { content: string } }).toolResult
+        .content,
+    ).toBe("file.txt");
+  });
+
+  it("mapTools emits descriptions and schemas under full_with_metadata_spans", () => {
+    const catalog: PiToolInfo[] = [
+      {
+        name: "bash",
+        description: "Run a shell command",
+        parameters: { type: "object" },
+      },
+    ];
+    const defs = mapTools(
+      catalog,
+      new Set(["bash"]),
+      "full_with_metadata_spans",
+    );
+    expect(defs).toEqual([
+      {
+        name: "bash",
+        description: "Run a shell command",
+        inputSchemaJSON: JSON.stringify({ type: "object" }),
+      },
+    ]);
+  });
+
   it("skips redacted thinking blocks", () => {
     const msg = makeMsg({
       content: [
@@ -494,6 +688,124 @@ describe("mapUserMessage", () => {
   });
 });
 
+describe("resolveConversationTitle", () => {
+  it("prefers a user-set session name over the first prompt", () => {
+    expect(
+      resolveConversationTitle({
+        sessionName: "My named session",
+        firstUserText: "summarize the go files",
+        conversationId: "pi-conv-1",
+        contentCapture: "full",
+      }),
+    ).toBe("My named session");
+  });
+
+  it("derives from the first prompt when no session name is set", () => {
+    expect(
+      resolveConversationTitle({
+        firstUserText: "summarize the go files",
+        conversationId: "pi-conv-1",
+        contentCapture: "full",
+      }),
+    ).toBe("summarize the go files");
+  });
+
+  it("trims whitespace from session name and derived title", () => {
+    expect(
+      resolveConversationTitle({
+        sessionName: "  spaced name  ",
+        contentCapture: "full",
+      }),
+    ).toBe("spaced name");
+    expect(
+      resolveConversationTitle({
+        firstUserText: "  hi there  ",
+        contentCapture: "full",
+      }),
+    ).toBe("hi there");
+  });
+
+  it("ignores a blank session name and falls through to the prompt", () => {
+    expect(
+      resolveConversationTitle({
+        sessionName: "   ",
+        firstUserText: "do the thing",
+        conversationId: "pi-conv-1",
+        contentCapture: "full",
+      }),
+    ).toBe("do the thing");
+  });
+
+  it("suppresses the derived title in metadata_only but keeps the session name", () => {
+    expect(
+      resolveConversationTitle({
+        firstUserText: "summarize the go files",
+        conversationId: "pi-conv-1",
+        contentCapture: "metadata_only",
+      }),
+    ).toBe("pi-conv-1");
+    expect(
+      resolveConversationTitle({
+        sessionName: "My named session",
+        firstUserText: "summarize the go files",
+        conversationId: "pi-conv-1",
+        contentCapture: "metadata_only",
+      }),
+    ).toBe("My named session");
+  });
+
+  it("falls back to the conversation id when nothing else is available", () => {
+    expect(
+      resolveConversationTitle({
+        conversationId: "pi-conv-1",
+        contentCapture: "full",
+      }),
+    ).toBe("pi-conv-1");
+  });
+
+  it("returns undefined when there is no name, prompt, or id", () => {
+    expect(
+      resolveConversationTitle({ contentCapture: "full" }),
+    ).toBeUndefined();
+  });
+
+  it("caps the title at MAX_TITLE_LEN code points without splitting surrogates", () => {
+    const long = "a".repeat(150);
+    expect(
+      resolveConversationTitle({ firstUserText: long, contentCapture: "full" }),
+    ).toHaveLength(MAX_TITLE_LEN);
+
+    // 150 two-code-unit emoji = 150 code points; the cap counts code points,
+    // so it clips to 100 without slicing mid-surrogate into a replacement char.
+    const emoji = "😀".repeat(150);
+    const clipped = resolveConversationTitle({
+      firstUserText: emoji,
+      contentCapture: "full",
+    });
+    expect(Array.from(clipped ?? "")).toHaveLength(MAX_TITLE_LEN);
+    expect(clipped).not.toContain("\uFFFD");
+  });
+});
+
+describe("userMessageText", () => {
+  it("returns string content as-is", () => {
+    expect(userMessageText(makeUserMsg({ content: "hello" }))).toBe("hello");
+  });
+
+  it("joins text parts and drops images", () => {
+    const text = userMessageText(
+      makeUserMsg({
+        content: [
+          { type: "text", text: "first" },
+          { type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+          { type: "text", text: "second" },
+        ],
+      }),
+    );
+    expect(text).toBe("first\nsecond");
+  });
+});
+
 describe("mapGenerationResult input wiring", () => {
   it("sets input when a non-empty list is passed", () => {
     const msg = makeMsg();
@@ -515,18 +827,232 @@ describe("mapGenerationResult input wiring", () => {
   });
 });
 
-describe("mapToolNames", () => {
-  it("deduplicates tool names", () => {
-    const timings = [
-      makeTiming({ toolName: "bash" }),
-      makeTiming({ toolName: "read" }),
-      makeTiming({ toolName: "bash" }),
+describe("mapTools", () => {
+  it("returns name-only under metadata_only", () => {
+    const catalog = [
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "read", description: "Read a file" }),
     ];
-    const defs = mapToolNames(timings);
+    const defs = mapTools(catalog, new Set(["bash", "read"]), "metadata_only");
     expect(defs).toEqual([{ name: "bash" }, { name: "read" }]);
   });
 
-  it("returns empty for no timings", () => {
-    expect(mapToolNames([])).toEqual([]);
+  it("returns name-only under no_tool_content", () => {
+    const catalog = [makeToolInfo({ name: "bash" })];
+    const defs = mapTools(catalog, new Set(["bash"]), "no_tool_content");
+    expect(defs).toEqual([{ name: "bash" }]);
+  });
+
+  it("returns name+description+inputSchemaJSON under full", () => {
+    const catalog = [
+      makeToolInfo({
+        name: "bash",
+        description: "Run a shell command",
+        parameters: { type: "object", properties: { cmd: { type: "string" } } },
+      }),
+    ];
+    const defs = mapTools(catalog, new Set(["bash"]), "full");
+    expect(defs).toHaveLength(1);
+    expect(defs[0]).toEqual({
+      name: "bash",
+      description: "Run a shell command",
+      inputSchemaJSON:
+        '{"type":"object","properties":{"cmd":{"type":"string"}}}',
+    });
+  });
+
+  it("filters by activeNames when set is non-empty", () => {
+    const catalog = [
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "read" }),
+      makeToolInfo({ name: "write" }),
+    ];
+    const defs = mapTools(catalog, new Set(["bash", "write"]), "metadata_only");
+    expect(defs.map((d) => d.name)).toEqual(["bash", "write"]);
+  });
+
+  it("emits the full catalog when activeNames is null (no filter)", () => {
+    // null means the active-set API is unavailable (older pi versions);
+    // emit the registry so something useful still ships.
+    const catalog = [
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "read" }),
+    ];
+    const defs = mapTools(catalog, null, "metadata_only");
+    expect(defs.map((d) => d.name)).toEqual(["bash", "read"]);
+  });
+
+  it("emits no tools when activeNames is an empty Set", () => {
+    // An empty Set means "no tools offered this turn" — different from null.
+    const catalog = [
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "read" }),
+    ];
+    expect(mapTools(catalog, new Set(), "metadata_only")).toEqual([]);
+  });
+
+  it("handles an empty catalog", () => {
+    expect(mapTools([], new Set(["bash"]), "full")).toEqual([]);
+  });
+
+  it("deduplicates by tool name", () => {
+    const catalog = [
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "bash" }),
+      makeToolInfo({ name: "read" }),
+    ];
+    const defs = mapTools(catalog, new Set(["bash", "read"]), "metadata_only");
+    expect(defs.map((d) => d.name)).toEqual(["bash", "read"]);
+  });
+
+  it("skips description under full when value is empty", () => {
+    const catalog = [makeToolInfo({ name: "bash", description: "" })];
+    const defs = mapTools(catalog, new Set(["bash"]), "full");
+    expect(defs[0]?.description).toBeUndefined();
+  });
+});
+
+describe("extractRequestControls", () => {
+  it("extracts Anthropic-shaped payload with thinking", () => {
+    const ctrls = extractRequestControls({
+      max_tokens: 4096,
+      temperature: 0.2,
+      top_p: 0.9,
+      tool_choice: { type: "auto" },
+      thinking: { type: "enabled", budget_tokens: 2048 },
+    });
+    expect(ctrls).toEqual({
+      maxTokens: 4096,
+      temperature: 0.2,
+      topP: 0.9,
+      toolChoice: "auto",
+      thinkingBudgetTokens: 2048,
+    });
+  });
+
+  it("preserves the forced tool name in Anthropic tool_choice", () => {
+    const ctrls = extractRequestControls({
+      tool_choice: { type: "tool", name: "search" },
+    });
+    expect(ctrls.toolChoice).toBe("tool:search");
+  });
+
+  it("falls back to type when forced-tool name is missing", () => {
+    const ctrls = extractRequestControls({
+      tool_choice: { type: "tool" },
+    });
+    expect(ctrls.toolChoice).toBe("tool");
+  });
+
+  it("accepts OpenAI Chat max_tokens", () => {
+    const ctrls = extractRequestControls({ max_tokens: 512 });
+    expect(ctrls.maxTokens).toBe(512);
+  });
+
+  it("accepts OpenAI Chat max_completion_tokens", () => {
+    const ctrls = extractRequestControls({ max_completion_tokens: 1024 });
+    expect(ctrls.maxTokens).toBe(1024);
+  });
+
+  it("accepts OpenAI Responses max_output_tokens", () => {
+    const ctrls = extractRequestControls({ max_output_tokens: 2000 });
+    expect(ctrls.maxTokens).toBe(2000);
+  });
+
+  it("reads Gemini config wrapper (pi's @google/genai SDK shape)", () => {
+    // Matches the payload pi's google.js builds: temperature/maxOutputTokens
+    // spread into `config`, plus toolConfig and thinkingConfig nests.
+    const ctrls = extractRequestControls({
+      model: "gemini-2.0-flash",
+      contents: [],
+      config: {
+        temperature: 0.7,
+        topP: 0.95,
+        maxOutputTokens: 8192,
+        toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+        thinkingConfig: { thinkingBudget: 1024 },
+      },
+    });
+    expect(ctrls).toEqual({
+      maxTokens: 8192,
+      temperature: 0.7,
+      topP: 0.95,
+      toolChoice: "AUTO",
+      thinkingBudgetTokens: 1024,
+    });
+  });
+
+  it("reads the legacy generationConfig nest too", () => {
+    const ctrls = extractRequestControls({
+      generationConfig: {
+        temperature: 0.7,
+        topP: 0.95,
+        maxOutputTokens: 8192,
+      },
+    });
+    expect(ctrls).toEqual({
+      maxTokens: 8192,
+      temperature: 0.7,
+      topP: 0.95,
+    });
+  });
+
+  it("prefers top-level fields over Gemini config wrapper", () => {
+    // If both shapes appear (shouldn't happen in practice), top-level wins.
+    const ctrls = extractRequestControls({
+      max_tokens: 256,
+      config: { maxOutputTokens: 8192 },
+    });
+    expect(ctrls.maxTokens).toBe(256);
+  });
+
+  it("accepts string tool_choice", () => {
+    expect(extractRequestControls({ tool_choice: "required" }).toolChoice).toBe(
+      "required",
+    );
+  });
+
+  it("accepts camelCase toolChoice and topP", () => {
+    const ctrls = extractRequestControls({
+      toolChoice: "none",
+      topP: 0.5,
+    });
+    expect(ctrls.toolChoice).toBe("none");
+    expect(ctrls.topP).toBe(0.5);
+  });
+
+  it("returns {} for null", () => {
+    expect(extractRequestControls(null)).toEqual({});
+  });
+
+  it("returns {} for undefined", () => {
+    expect(extractRequestControls(undefined)).toEqual({});
+  });
+
+  it("returns {} for a string", () => {
+    expect(extractRequestControls("hello")).toEqual({});
+  });
+
+  it("returns {} for a number", () => {
+    expect(extractRequestControls(42)).toEqual({});
+  });
+
+  it("returns {} for an array", () => {
+    expect(extractRequestControls([1, 2])).toEqual({});
+  });
+
+  it("ignores non-finite numbers", () => {
+    const ctrls = extractRequestControls({
+      max_tokens: Number.NaN,
+      temperature: Number.POSITIVE_INFINITY,
+    });
+    expect(ctrls).toEqual({});
+  });
+
+  it("skips thinking budget when not numeric", () => {
+    const ctrls = extractRequestControls({
+      thinking: { type: "enabled", budget_tokens: "lots" },
+    });
+    expect(ctrls.thinkingBudgetTokens).toBeUndefined();
   });
 });

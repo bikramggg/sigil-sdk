@@ -15,6 +15,7 @@ import (
 
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/cursor/fragment"
 	"github.com/grafana/sigil-sdk/plugins/sigil/internal/agents/cursor/tags"
+	"github.com/grafana/sigil-sdk/plugins/sigil/internal/timeutil"
 )
 
 var errCursorStop = errors.New("cursor_stop_error")
@@ -69,8 +70,8 @@ func MapFragment(in Inputs) Mapped {
 		now = time.Now()
 	}
 
-	completedAt := parseTimestamp(frag.LastEventAt, now)
-	startedAt := parseTimestamp(frag.StartedAt, completedAt)
+	completedAt := timeutil.ParseTimestamp(frag.LastEventAt, now)
+	startedAt := timeutil.ParseTimestamp(frag.StartedAt, completedAt)
 
 	// Provider/model fallback: SDK validation requires both to be non-empty.
 	provider := frag.Provider
@@ -92,12 +93,13 @@ func MapFragment(in Inputs) Mapped {
 	if in.Session != nil && len(in.Session.WorkspaceRoots) > 0 {
 		workspaceRoot = in.Session.WorkspaceRoots[0]
 	}
-	var cursorVersion, userEmail string
+	var cursorVersion, userEmail, conversationTitle string
 	var isBackgroundAgent bool
 	if in.Session != nil {
 		cursorVersion = in.Session.CursorVersion
 		userEmail = in.Session.UserEmail
 		isBackgroundAgent = in.Session.IsBackgroundAgent
+		conversationTitle = in.Session.ConversationTitle
 	}
 
 	tagMap := tags.Build(tags.BuiltinInputs{
@@ -118,44 +120,46 @@ func MapFragment(in Inputs) Mapped {
 	}
 
 	start := sigil.GenerationStart{
-		ID:               frag.GenerationID,
-		ConversationID:   frag.ConversationID,
-		UserID:           uid,
-		AgentName:        AgentName,
-		AgentVersion:     cursorVersion,
-		EffectiveVersion: cursorVersion,
-		Mode:             sigil.GenerationModeSync,
-		OperationName:    "generateText",
-		Model:            model,
-		Tools:            toolDefs,
-		ThinkingEnabled:  thinkingEnabled,
-		Tags:             tagMap,
-		StartedAt:        startedAt,
-		ContentCapture:   in.ContentCapture,
+		ID:                frag.GenerationID,
+		ConversationID:    frag.ConversationID,
+		ConversationTitle: conversationTitle,
+		UserID:            uid,
+		AgentName:         AgentName,
+		AgentVersion:      cursorVersion,
+		EffectiveVersion:  cursorVersion,
+		Mode:              sigil.GenerationModeSync,
+		OperationName:     "generateText",
+		Model:             model,
+		Tools:             toolDefs,
+		ThinkingEnabled:   thinkingEnabled,
+		Tags:              tagMap,
+		StartedAt:         startedAt,
+		ContentCapture:    in.ContentCapture,
 	}
 
 	input, output := buildMessages(frag, in.ContentCapture)
 
 	gen := sigil.Generation{
-		ID:               frag.GenerationID,
-		ConversationID:   frag.ConversationID,
-		UserID:           uid,
-		AgentName:        AgentName,
-		AgentVersion:     cursorVersion,
-		EffectiveVersion: cursorVersion,
-		Mode:             sigil.GenerationModeSync,
-		OperationName:    "generateText",
-		Model:            model,
-		ResponseModel:    modelName,
-		Input:            input,
-		Output:           output,
-		Tools:            toolDefs,
-		ThinkingEnabled:  thinkingEnabled,
-		Usage:            mapTokenUsage(frag.TokenUsage),
-		StopReason:       string(stopStatus),
-		StartedAt:        startedAt,
-		CompletedAt:      completedAt,
-		Tags:             tagMap,
+		ID:                frag.GenerationID,
+		ConversationID:    frag.ConversationID,
+		ConversationTitle: conversationTitle,
+		UserID:            uid,
+		AgentName:         AgentName,
+		AgentVersion:      cursorVersion,
+		EffectiveVersion:  cursorVersion,
+		Mode:              sigil.GenerationModeSync,
+		OperationName:     "generateText",
+		Model:             model,
+		ResponseModel:     modelName,
+		Input:             input,
+		Output:            output,
+		Tools:             toolDefs,
+		ThinkingEnabled:   thinkingEnabled,
+		Usage:             mapTokenUsage(frag.TokenUsage),
+		StopReason:        string(stopStatus),
+		StartedAt:         startedAt,
+		CompletedAt:       completedAt,
+		Tags:              tagMap,
 	}
 
 	mapped := Mapped{
@@ -278,11 +282,18 @@ func buildToolDefinitions(tools []fragment.ToolRecord) []sigil.ToolDefinition {
 
 func buildMessages(frag *fragment.Fragment, mode sigil.ContentCaptureMode) (input, output []sigil.Message) {
 	// Normalize so the rest of this function only deals with the three real
-	// modes. envconfig.ResolveContentMode also maps Default → MetadataOnly,
-	// but doing it again here keeps the three content-gating checks below
-	// internally consistent regardless of caller.
-	if mode == sigil.ContentCaptureModeDefault {
+	// content-gating modes. envconfig.ResolveContentMode also maps Default →
+	// MetadataOnly, but doing it again here keeps the gating below internally
+	// consistent regardless of caller. FullWithMetadataSpans differs from
+	// Full only in what the OTel span exposes; the gRPC payload that
+	// buildMessages produces carries the same full content in both modes.
+	switch mode {
+	case sigil.ContentCaptureModeDefault:
 		mode = sigil.ContentCaptureModeMetadataOnly
+	case sigil.ContentCaptureModeFullWithMetadataSpans:
+		mode = sigil.ContentCaptureModeFull
+	default:
+		// Full, NoToolContent, MetadataOnly pass through unchanged.
 	}
 
 	// User prompt → user input message. Dropped in metadata-only mode.
@@ -357,6 +368,8 @@ func buildMessages(frag *fragment.Fragment, mode sigil.ContentCaptureMode) (inpu
 			})
 		case sigil.ContentCaptureModeMetadataOnly:
 			// Drop the tool_result entirely.
+		default:
+			// Default and FullWithMetadataSpans are normalized away above.
 		}
 	}
 
@@ -400,19 +413,4 @@ func mapTokenUsage(t *fragment.TokenCounts) sigil.TokenUsage {
 		u.TotalTokens = u.InputTokens + u.OutputTokens
 	}
 	return u
-}
-
-// parseTimestamp parses an ISO-8601 timestamp, falling back to `def` when the
-// input is empty or unparseable.
-func parseTimestamp(s string, def time.Time) time.Time {
-	if s == "" {
-		return def
-	}
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t
-	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t
-	}
-	return def
 }
